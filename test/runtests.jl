@@ -62,6 +62,7 @@ using Test, Harbor
 
     # Test with_container block.
     @testset "with_container" begin
+        img = Harbor.pull("alpine"; tag="latest")
         result = Harbor.with_container(img; command=["sleep", "1"]) do cont
             @test cont.status == :running
             # Return a simple result.
