@@ -19,4 +19,28 @@ Pkg.add("Harbor")
 
 ```julia
 using Harbor
+
+# pull an image
+Harbor.pull("alpine")
+
+# list images
+Harbor.images()
+
+# run a container
+container = Harbor.run!("alpine"; command=["echo", "hello world"])
+
+# list containers
+Harbor.ps()
+
+# stop a container
+Harbor.stop!(container)
+
+# remove a container
+Harbor.remove!(container)
+
+# lifecycle-managed container block
+Harbor.with_container("alpine") do container
+    # container is automatically stopped and removed at the end of this block
+end
+
 ```
