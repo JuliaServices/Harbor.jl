@@ -1,7 +1,7 @@
-# Example
+# Harbor
 
-Example Julia package repo.
+Harbor Julia package repo.
 
 ```@autodocs
-Modules = [Example]
+Modules = [Harbor]
 ```

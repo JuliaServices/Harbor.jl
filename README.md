@@ -1,8 +1,22 @@
-Example Julia package repo.
+# Harbor
 
-[![](https://img.shields.io/badge/docs-stable-blue.svg)](https://JuliaLang.github.io/Example.jl/stable)
-[![](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaLang.github.io/Example.jl/dev)
+Julia package for managing docker images and containers,
+with an aim to make testing with external resources simple and easy.
 
-GitHub Actions : [![Build Status](https://github.com/JuliaLang/Example.jl/workflows/CI/badge.svg)](https://github.com/JuliaLang/Example.jl/actions?query=workflow%3ACI+branch%3Amaster)
+[![](https://img.shields.io/badge/docs-stable-blue.svg)](https://JuliaServices.github.io/Harbor.jl/stable)
+[![](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaServices.github.io/Harbor.jl/dev)
 
-[![codecov.io](http://codecov.io/github/JuliaLang/Example.jl/coverage.svg?branch=master)](http://codecov.io/github/JuliaLang/Example.jl?branch=master)
+GitHub Actions : [![Build Status](https://github.com/JuliaServices/Harbor.jl/workflows/CI/badge.svg)](https://github.com/JuliaServices/Harbor.jl/actions?query=workflow%3ACI+branch%3Amain)
+
+## Installation
+
+```julia
+using Pkg
+Pkg.add("Harbor")
+```
+
+## Usage
+
+```julia
+using Harbor
+```

@@ -1,5 +1,5 @@
-using Documenter, Example
+using Documenter, Harbor
 
-makedocs(modules = [Example], sitename = "Example.jl")
+makedocs(modules = [Harbor], sitename = "Harbor.jl")
 
-deploydocs(repo = "github.com/quinnj/Example.jl.git", push_preview = true)
+deploydocs(repo = "github.com/JuliaServices/Harbor.jl.git", push_preview = true)
