@@ -69,6 +69,12 @@ using Test, Harbor
             "done"
         end
         @test result == "done"
+        result = Harbor.with_container("alpine"; command=["sleep", "1"]) do cont
+            @test cont.status == :running
+            # Return a simple result.
+            "done"
+        end
+        @test result == "done"
     end
 
 end

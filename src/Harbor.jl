@@ -197,6 +197,8 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     return cont
 end
 
+run!(image; tag::String="latest", kw...) = run!(pull(image; tag=tag); kw...)
+
 """
 inspect(container::Container) -> Dict
 
@@ -305,5 +307,7 @@ function with_container(f::Function, image::Image; kw...)
         remove!(container)
     end
 end
+
+with_container(f::Function, image::String; tag="latest", kw...) = with_container(f, pull(image; tag=tag); kw...)
 
 end
