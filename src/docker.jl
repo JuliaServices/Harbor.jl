@@ -104,9 +104,9 @@ function docker_ps(; all::Bool=false)::Vector{String}
 end
 
 """
-    docker_inspect_container(container_id::String) -> Dict
+    docker_inspect_container(container_id::String) -> JSON object
 
-Runs `docker inspect <container_id>` and returns the parsed JSON as a Dict.
+Runs `docker inspect <container_id>` and returns the parsed JSON.
 """
 function docker_inspect_container(container_id::String)
     cmd = Cmd(["docker", "inspect", container_id])
