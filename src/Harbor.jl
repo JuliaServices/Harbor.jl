@@ -65,7 +65,7 @@ mutable struct Container
     created_at::Union{DateTime, Nothing} # Timestamp of creation
     options::RunOptions                  # Options used when creating the container
 
-    function Container(id, image, symbol, created_at, options
+    function Container(id, image, symbol, created_at, options)
         x = new(id, image, symbol, created_at, options)
         finalizer(x) do x
             try
