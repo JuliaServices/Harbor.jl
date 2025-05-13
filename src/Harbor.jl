@@ -67,10 +67,11 @@ mutable struct Container
 
     function Container(id, image, symbol, created_at, options)
         x = new(id, image, symbol, created_at, options)
-        finalizer(x) do x
-            for cid in docker_ps(; all=true)
-                if cid == x.id
-                    docker_stop(cid; timeout=10)
+        finalizer(x) do _
+            ids = docker_ps(; all=true)
+            for cid in ids
+                if cid == id
+                    docker_stop(cid)
                     docker_rm(cid; force=true)
                     break
                 end

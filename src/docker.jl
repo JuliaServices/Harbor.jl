@@ -95,9 +95,9 @@ Runs `docker ps` (or `docker ps -a` if all is true) and returns a vector of cont
 """
 function docker_ps(; all::Bool=false)::Vector{String}
     if all
-        cmd = Cmd(["docker", "ps", "-a", "--format", "{{.ID}}"])
+        cmd = Cmd(["docker", "ps", "--no-trunc", "-a", "--format", "{{.ID}}"])
     else
-        cmd = Cmd(["docker", "ps", "--format", "{{.ID}}"])
+        cmd = Cmd(["docker", "ps", "--no-trunc", "--format", "{{.ID}}"])
     end
     output = read(cmd, String)
     return [line for line in split(output, "\n") if !isempty(line)]
