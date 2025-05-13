@@ -68,11 +68,13 @@ mutable struct Container
     function Container(id, image, symbol, created_at, options)
         x = new(id, image, symbol, created_at, options)
         finalizer(x) do x
-            try
-                stop!(x)
-            catch
+            for cid in docker_ps(; all=true)
+                if cid == x.id
+                    docker_stop(cid; timeout=10)
+                    docker_rm(cid; force=true)
+                    break
+                end
             end
-            remove!(x; force=true)
         end
         return x
     end
@@ -314,9 +316,7 @@ function with_container(f::Function, image::Image; kw...)
     try
         return f(container)
     finally
-        # Ensure graceful cleanup
-        stop!(container)
-        remove!(container)
+        finalize(container)
     end
 end
 
