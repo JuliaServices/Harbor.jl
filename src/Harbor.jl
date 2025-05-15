@@ -312,10 +312,16 @@ end
 Runs a container with the specified image and keyword options. The container is automatically
 stopped and removed after the block completes (even if an error occurs).
 """
-function with_container(f::Function, image::Image; kw...)
+function with_container(f::Function, image::Image; container_logs_on_error::Bool=false, kw...)
     container = run!(image; kw...)
     try
         return f(container)
+    catch
+        if container_logs_on_error
+            logs_output = docker_logs(container.id; follow=false, tail="all")
+            @error logs_output
+        end
+        rethrow()
     finally
         finalize(container)
     end
