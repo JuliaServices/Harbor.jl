@@ -29,6 +29,9 @@ Harbor.images()
 # run a container
 container = Harbor.run!("alpine"; command=["echo", "hello world"])
 
+# exec in a container
+output = Harbor.exec(container, ["sh", "-c", "echo -n hi"])
+
 # list containers
 Harbor.ps()
 
