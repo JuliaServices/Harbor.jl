@@ -68,13 +68,19 @@ mutable struct Container
     function Container(id, image, symbol, created_at, options)
         x = new(id, image, symbol, created_at, options)
         finalizer(x) do _
-            ids = docker_ps(; all=true)
-            for cid in ids
-                if cid == id
-                    docker_stop(cid)
-                    docker_rm(cid; force=true)
-                    break
+            # Must use @async because finalizers cannot perform task switches
+            # (I/O operations like docker commands require task switches)
+            @async try
+                ids = docker_ps(; all=true)
+                for cid in ids
+                    if cid == id
+                        docker_stop(cid)
+                        docker_rm(cid; force=true)
+                        break
+                    end
                 end
+            catch e
+                @debug "Container cleanup failed" exception=(e, catch_backtrace())
             end
         end
         return x
