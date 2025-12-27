@@ -234,6 +234,16 @@ function logs(container::Container; follow::Bool=false, tail::Union{String,Int}=
 end
 
 """
+exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...) -> String
+
+Runs a command inside the specified container.
+"""
+function exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...)::String
+    @info "Executing command in container" container_id=container.id
+    return docker_exec(container.id, exec_cmd; kw...)
+end
+
+"""
 stop!(container::Container; timeout::Int=10) -> Container
 
 Gracefully stops a running container. Returns the `Container` with a new status.

@@ -44,6 +44,14 @@ using Test, Harbor
         # Check logs (they might be empty if nothing was output, but should be a String).
         logs_output = Harbor.logs(cont; follow=false, tail="100")
         @test isa(logs_output, String)
+        exec_output = Harbor.exec(cont, ["sh", "-c", "echo -n hi"])
+        @test chomp(exec_output) == "hi"
+        env_output = Harbor.exec(cont, ["sh", "-c", "echo -n \$FOO"]; env=Dict("FOO" => "bar"))
+        @test chomp(env_output) == "bar"
+        workdir_output = Harbor.exec(cont, ["pwd"]; workdir="/tmp")
+        @test chomp(workdir_output) == "/tmp"
+        user_output = Harbor.exec(cont, ["id", "-u"]; user="root")
+        @test chomp(user_output) == "0"
         
         # Stop the container.
         cont = Harbor.stop!(cont; timeout=5)

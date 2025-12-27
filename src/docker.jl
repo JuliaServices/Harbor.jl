@@ -118,10 +118,10 @@ end
 """
     docker_stop(container_id::String; timeout::Int=10) -> Bool
 
-Runs `docker stop --time=<timeout> <container_id>`. Returns true if successful.
+Runs `docker stop --timeout=<timeout> <container_id>`. Returns true if successful.
 """
 function docker_stop(container_id::String; timeout::Int=10)::Bool
-    cmd = Cmd(["docker", "stop", "--time=" * string(timeout), container_id])
+    cmd = Cmd(["docker", "stop", "--timeout=" * string(timeout), container_id])
     run(cmd)
     return true
 end
@@ -169,14 +169,55 @@ function docker_logs(container_id::String; follow::Bool=false, tail::Union{Strin
 end
 
 """
-    docker_exec(container_id::String, exec_cmd::Vector{String}; detach::Bool=false) -> String
+    docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractString};
+                detach::Bool=false, detach_keys::Union{Nothing,AbstractString}=nothing,
+                env::Union{Nothing,AbstractDict{<:AbstractString,<:AbstractString}}=nothing,
+                env_file::Union{Nothing,AbstractString,AbstractVector{<:AbstractString}}=nothing,
+                interactive::Bool=false, privileged::Bool=false, tty::Bool=false,
+                user::Union{Nothing,AbstractString}=nothing,
+                workdir::Union{Nothing,AbstractString}=nothing) -> String
 
 Runs `docker exec` on the specified container. Returns the command output as a string.
 """
-function docker_exec(container_id::String, exec_cmd::Vector{String}; detach::Bool=false)::String
-    args = detach ? ["-d"] : String[]
+function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractString};
+                     detach::Bool=false, detach_keys::Union{Nothing,AbstractString}=nothing,
+                     env::Union{Nothing,AbstractDict{<:AbstractString,<:AbstractString}}=nothing,
+                     env_file::Union{Nothing,AbstractString,AbstractVector{<:AbstractString}}=nothing,
+                     interactive::Bool=false, privileged::Bool=false, tty::Bool=false,
+                     user::Union{Nothing,AbstractString}=nothing,
+                     workdir::Union{Nothing,AbstractString}=nothing)::String
+    args = String[]
+    detach && push!(args, "-d")
+    interactive && push!(args, "-i")
+    tty && push!(args, "-t")
+    privileged && push!(args, "--privileged")
+    if detach_keys !== nothing
+        push!(args, "--detach-keys", String(detach_keys))
+    end
+    if user !== nothing
+        push!(args, "-u", String(user))
+    end
+    if workdir !== nothing
+        push!(args, "-w", String(workdir))
+    end
+    if env !== nothing
+        for (key, val) in env
+            push!(args, "-e", string(key, "=", val))
+        end
+    end
+    if env_file !== nothing
+        if env_file isa AbstractVector{<:AbstractString}
+            for file in env_file
+                push!(args, "--env-file", String(file))
+            end
+        else
+            push!(args, "--env-file", String(env_file))
+        end
+    end
     push!(args, container_id)
-    append!(args, exec_cmd)
+    for part in exec_cmd
+        push!(args, String(part))
+    end
     cmd = Cmd(vcat(["docker", "exec"], args))
     return read(cmd, String)
 end
@@ -195,10 +236,10 @@ end
 """
     docker_restart(container_id::String; timeout::Int=10) -> Bool
 
-Runs `docker restart --time=<timeout> <container_id>`. Returns true if successful.
+Runs `docker restart --timeout=<timeout> <container_id>`. Returns true if successful.
 """
 function docker_restart(container_id::String; timeout::Int=10)::Bool
-    cmd = Cmd(["docker", "restart", "--time=" * string(timeout), container_id])
+    cmd = Cmd(["docker", "restart", "--timeout=" * string(timeout), container_id])
     run(cmd)
     return true
 end
