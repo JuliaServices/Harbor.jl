@@ -165,7 +165,9 @@ function docker_logs(container_id::String; follow::Bool=false, tail::Union{Strin
     push!(args, "--tail=" * string(tail))
     push!(args, container_id)
     cmd = Cmd(vcat(["docker", "logs"], args))
-    return read(cmd, String)
+    output = PipeBuffer()
+    run(pipeline(cmd; stdout=output, stderr=output))
+    return String(take!(output))
 end
 
 """
