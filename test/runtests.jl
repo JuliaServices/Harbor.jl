@@ -23,7 +23,7 @@ using Test, Harbor
     @testset "remove image" begin
         # We pull a temporary image for removal.
         tmp_img = Harbor.pull("alpine"; tag="latest")
-        removal_result = Harbor.remove(tmp_img; force=false)
+        removal_result = Harbor.remove(tmp_img; force=true)
         @test removal_result == true
     end
 
@@ -80,6 +80,21 @@ using Test, Harbor
         result = Harbor.with_container("alpine"; command=["sleep", "1"]) do cont
             @test cont.status == :running
             # Return a simple result.
+            "done"
+        end
+        @test result == "done"
+    end
+
+    @testset "log wait captures stderr" begin
+        result = Harbor.with_container(
+            "alpine";
+            command=["sh", "-c", "echo stdout-ready; echo stderr-ready >&2; sleep 1"],
+            wait_strategy=(pattern="stderr-ready",),
+            wait_timeout=5.0,
+        ) do cont
+            logs_output = Harbor.logs(cont; follow=false, tail="all")
+            @test occursin("stdout-ready", logs_output)
+            @test occursin("stderr-ready", logs_output)
             "done"
         end
         @test result == "done"
