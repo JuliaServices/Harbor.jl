@@ -21,10 +21,12 @@ end
 # stderr is captured and included in the DockerError thrown on failure.
 # With `stderr_to_stdout=true`, stderr is merged into the returned output instead.
 function docker_read(args::Vector{String}; env=nothing, stderr_to_stdout::Bool=false)::String
-    cmd = Cmd(vcat(["docker"], args))
-    if env !== nothing
-        cmd = addenv(cmd, env)
-    end
+    # `base` (argv only) is what any thrown DockerError carries: `addenv`
+    # materializes the entire process environment into cmd.env, and showing
+    # that in an exception would leak every env var value — including the
+    # secrets the -e KEY forwarding scheme exists to keep out of logs.
+    base = Cmd(vcat(["docker"], args))
+    cmd = env === nothing ? base : addenv(base, env)
     out = IOBuffer()
     err = stderr_to_stdout ? out : IOBuffer()
     proc = try
@@ -37,7 +39,7 @@ function docker_read(args::Vector{String}; env=nothing, stderr_to_stdout::Bool=f
     end
     output = String(take!(out))
     if !success(proc)
-        throw(DockerError(cmd, proc.exitcode, stderr_to_stdout ? output : String(take!(err))))
+        throw(DockerError(base, proc.exitcode, stderr_to_stdout ? output : String(take!(err))))
     end
     return output
 end
