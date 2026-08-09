@@ -10,17 +10,47 @@ end
 
 Image(name::String, tag::String="latest") = Image(name, tag, nothing)
 
+# Split an image reference "name[:tag][@digest]" into its parts. A ':' only
+# counts as a tag separator when it appears after the last '/', so registry
+# hosts with ports ("localhost:5000/img") parse correctly.
+function _split_ref(ref::AbstractString)
+    name = ref
+    digest = nothing
+    i = findlast('@', name)
+    if i !== nothing
+        digest = String(name[i+1:end])
+        name = name[1:i-1]
+    end
+    slash = findlast('/', name)
+    colon = findlast(':', name)
+    tag = nothing
+    if colon !== nothing && (slash === nothing || colon > slash)
+        tag = String(name[colon+1:end])
+        name = name[1:colon-1]
+    end
+    return String(name), tag, digest
+end
+
 include("docker.jl")
 
 """
-pull(image::String; tag::String="latest") -> Image
+pull(image::String; tag::Union{Nothing, String}=nothing) -> Image
 
-Pulls an image from a registry and returns an `Image` instance.
+Pulls an image from a registry and returns an `Image` instance. `image` may be
+a bare name (`"alpine"`), include a tag (`"alpine:3.19"`), or be pinned to a
+digest (`"alpine@sha256:..."`). When no tag is given in either the reference or
+the `tag` keyword, `"latest"` is used. The returned `Image` records the
+image's registry digest when it can be determined.
 """
-function pull(image::String; tag::String="latest")::Image
-    @info "Pulling image" image tag=tag
+function pull(image::String; tag::Union{Nothing, String}=nothing)::Image
     isempty(image) && throw(ArgumentError("Image name cannot be empty"))
-    return docker_pull(image; tag=tag)
+    name, ref_tag, digest = _split_ref(image)
+    if ref_tag !== nothing && tag !== nothing && ref_tag != tag
+        throw(ArgumentError("conflicting tags: image reference \"$image\" specifies tag \"$ref_tag\" but tag=\"$tag\" was also given"))
+    end
+    tag = something(ref_tag, tag, "latest")
+    @info "Pulling image" name tag digest
+    return docker_pull(name; tag, digest)
 end
 
 """

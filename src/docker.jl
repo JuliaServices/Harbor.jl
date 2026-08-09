@@ -42,28 +42,47 @@ function docker_read(args::Vector{String}; env=nothing, stderr_to_stdout::Bool=f
     return output
 end
 
-"""
-    docker_pull(image_name::String; tag::String="latest") -> Image
+# The CLI reference for an image: pinned to its digest when known, else name:tag.
+image_ref(image::Image) = image.digest === nothing ? string(image.name, ":", image.tag) : string(image.name, "@", image.digest)
 
-Runs `docker pull <image_name>:<tag>`. On success, returns an `Image` struct.
 """
-function docker_pull(image_name::String; tag::String="latest")::Image
-    docker_read(["pull", string(image_name, ":", tag)])
-    return Image(image_name, tag, nothing)
+    docker_pull(image_name::String; tag::String="latest", digest=nothing) -> Image
+
+Runs `docker pull <image_name>:<tag>` (or `<image_name>@<digest>` when a digest
+is given). On success, returns an `Image` struct with the image's registry
+digest populated when it can be determined.
+"""
+function docker_pull(image_name::String; tag::String="latest",
+                     digest::Union{Nothing, String}=nothing)::Image
+    ref = digest === nothing ? string(image_name, ":", tag) : string(image_name, "@", digest)
+    docker_read(["pull", ref])
+    if digest === nothing
+        digest = try
+            repo_digest = chomp(docker_read(["image", "inspect", "--format", "{{index .RepoDigests 0}}", ref]))
+            String(last(split(repo_digest, "@")))
+        catch
+            # e.g. locally-built images have no RepoDigests
+            nothing
+        end
+    end
+    return Image(image_name, tag, digest)
 end
 
 """
     docker_images() -> Vector{Image}
 
-Runs `docker images` and returns a vector of `Image` structs.
+Runs `docker images` and returns a vector of `Image` structs. Dangling images
+(`<none>` repository or tag) are omitted.
 """
 function docker_images()::Vector{Image}
     output = docker_read(["images", "--format", "{{.Repository}}:{{.Tag}}"])
     images = Image[]
     for line in split(output, "\n")
         isempty(line) && continue
-        parts = split(line, ":")
-        push!(images, Image(String(parts[1]), String(parts[2]), nothing))
+        # rsplit: the repository may itself contain ':' (registry host port)
+        name, tag = rsplit(line, ":"; limit=2)
+        (name == "<none>" || tag == "<none>") && continue
+        push!(images, Image(String(name), String(tag), nothing))
     end
     return images
 end
@@ -76,6 +95,7 @@ Runs `docker rmi [--force] <image>`. Returns `true` on success.
 function docker_rm_image(image::Image; force::Bool=false)::Bool
     args = ["rmi"]
     force && push!(args, "--force")
+    # remove by name:tag (removing by digest would leave the tag behind)
     push!(args, string(image.name, ":", image.tag))
     docker_read(args)
     return true
@@ -115,7 +135,7 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
         push!(args, "-e", string(key, "=", val))
     end
     # Base image.
-    push!(args, string(image.name, ":", image.tag))
+    push!(args, image_ref(image))
     # Append command if provided.
     if command !== nothing
         append!(args, command)
