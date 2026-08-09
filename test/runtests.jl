@@ -1,5 +1,11 @@
 using Test, Harbor, Dates, Sockets
 
+# Remove containers a previously crashed test run may have left behind, so
+# fixed-name `docker run`s below don't collide.
+for leftover in ["harbor-ps-safety-test", "harbor-wait-timeout-test", "harbor-name-reuse-test"]
+    run(pipeline(ignorestatus(`docker rm -f $leftover`); stdout=devnull, stderr=devnull))
+end
+
 @testset "Harbor" begin
 
     # Pure parsing tests (no docker required).

@@ -585,14 +585,16 @@ Containers not started by Harbor are never touched.
 """
 function prune()::Int
     ids = docker_ps(; all=true, label=HARBOR_LABEL * "=true")
+    removed = 0
     for id in ids
         try
             docker_rm(id; force=true)
+            removed += 1
         catch e
             @debug "Failed to prune container" container_id=id exception=(e, catch_backtrace())
         end
     end
-    return length(ids)
+    return removed
 end
 
 """
