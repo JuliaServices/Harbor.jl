@@ -49,7 +49,7 @@ function pull(image::String; tag::Union{Nothing, String}=nothing)::Image
         throw(ArgumentError("conflicting tags: image reference \"$image\" specifies tag \"$ref_tag\" but tag=\"$tag\" was also given"))
     end
     tag = something(ref_tag, tag, "latest")
-    @info "Pulling image" name tag digest
+    @debug "Pulling image" name tag digest
     return docker_pull(name; tag, digest)
 end
 
@@ -66,7 +66,7 @@ remove(image::Image; force::Bool=false) -> Bool
 Removes the specified image.
 """
 function remove(image::Image; force::Bool=false)::Bool
-    @info "Removing image" image force
+    @debug "Removing image" image force
     return docker_rm_image(image; force=force)
 end
 
@@ -300,12 +300,28 @@ function wait_for(container::Container)
 end
 
 """
-run!(image::Image; name=nothing, ports=Dict{Int,Int}(), 
-              volumes=Dict{String,String}(), environment=Dict{String,String}(), 
-              command=nothing, detach::Bool=false) -> Container
+run!(image::Union{Image, AbstractString}; name=nothing, ports=Dict{Int,Int}(),
+     volumes=Dict{String,String}(), environment=Dict{String,String}(),
+     command=nothing, detach::Bool=true, wait_strategy=nothing,
+     wait_timeout=60.0, wait_interval=1.0) -> Container
 
-Starts a container from the provided `Image` with the specified options.
-Returns a `Container` instance reflecting the running state.
+Starts a container from the provided `Image` (or image reference string, which
+is pulled first) and returns a `Container` handle.
+
+- `ports` maps container ports to host ports; a host port of `0` publishes the
+  container port on an OS-assigned ephemeral port (see [`host_port`](@ref)).
+  When `ports` is non-empty and no `wait_strategy` is given, `run!` waits for
+  the first mapped port to accept connections.
+- `wait_strategy` may be `(port=...,)`, `(pattern=string_or_regex,)`,
+  `(url=..., expected_status=...)`, `(healthy=true,)`, or a function
+  `container -> Bool`. If the strategy is not satisfied within `wait_timeout`
+  seconds, the container is removed and a [`WaitTimeoutError`](@ref) is thrown.
+- With `detach=false` the call blocks until the container exits; use
+  [`logs`](@ref) to retrieve its output.
+
+The started container is force-removed by a garbage-collection finalizer as a
+safety net; prefer [`with_container`](@ref) (or explicit [`remove!`](@ref)) for
+deterministic cleanup.
 """
 function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)::Container
     ports = Dict{Int, Int}(ports)
@@ -330,7 +346,7 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     # A foreground (detach=false) run only returns once the container exits.
     cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts, resolved_ports; managed=true)
     if opts.wait_strategy !== nothing
-        @info "Waiting for container to be ready using strategy $(opts.wait_strategy)"
+        @debug "Waiting for container to be ready using strategy $(opts.wait_strategy)"
         try
             wait_for(cont)
         catch
@@ -362,29 +378,35 @@ end
 """
 inspect(container::Container) -> Dict
 
+Returns the container's full `docker inspect` output as a parsed JSON object.
 """
 function inspect(container::Container) :: Dict
-    @info "Inspecting container" container_id=container.id
+    @debug "Inspecting container" container_id=container.id
     return docker_inspect_container(container.id)
 end
 
 """
-logs(container::Container) -> String
+logs(container::Container; follow::Bool=false, tail="all") -> String
 
-Retrieves the logs for the specified container.
+Retrieves the logs (stdout and stderr merged) for the specified container.
+With `follow=true` the call blocks until the container stops, then returns the
+complete log output. `tail` limits the result to the last N lines.
 """
 function logs(container::Container; follow::Bool=false, tail::Union{String,Int}="all") :: String
-    @info "Fetching logs for container" container_id=container.id
+    @debug "Fetching logs for container" container_id=container.id
     return docker_logs(container.id; follow=follow, tail=tail)
 end
 
 """
 exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...) -> String
 
-Runs a command inside the specified container.
+Runs a command inside the specified container and returns its stdout. Throws a
+[`DockerError`](@ref) carrying the exit code and captured stderr if the command
+fails. Supported keywords mirror `docker exec` flags: `env`, `workdir`, `user`,
+`detach`, `interactive`, `tty`, `privileged`, `env_file`, `detach_keys`.
 """
 function exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...)::String
-    @info "Executing command in container" container_id=container.id
+    @debug "Executing command in container" container_id=container.id
     return docker_exec(container.id, exec_cmd; kw...)
 end
 
@@ -395,7 +417,7 @@ Gracefully stops a running container. Returns the `Container` with a new status.
 """
 function stop!(container::Container; timeout::Int=10)::Container
     # Stop the container via underlying system calls.
-    @info "Stopping container" container_id=container.id timeout=timeout
+    @debug "Stopping container" container_id=container.id timeout=timeout
     docker_stop(container.id; timeout=timeout)
     container.status = :stopped
     return container
@@ -408,7 +430,7 @@ Starts a stopped container. Returns the `Container` with an updated status
 and refreshed host port mappings (ephemeral ports may be re-assigned).
 """
 function start!(container::Container)::Container
-    @info "Starting container" container_id=container.id
+    @debug "Starting container" container_id=container.id
     docker_start(container.id)
     container.status = :running
     isempty(container.options.ports) || (container.ports = docker_resolved_ports(container.id))
@@ -423,7 +445,7 @@ grace). Returns the `Container` with an updated status and refreshed host
 port mappings.
 """
 function restart!(container::Container; timeout::Int=10)::Container
-    @info "Restarting container" container_id=container.id timeout=timeout
+    @debug "Restarting container" container_id=container.id timeout=timeout
     docker_restart(container.id; timeout=timeout)
     container.status = :running
     isempty(container.options.ports) || (container.ports = docker_resolved_ports(container.id))
@@ -437,7 +459,7 @@ Sends `signal` to the container's main process (default `SIGKILL`).
 Returns the `Container` with an updated status.
 """
 function kill!(container::Container; signal::Union{String, Int}="SIGKILL")::Container
-    @info "Killing container" container_id=container.id signal=signal
+    @debug "Killing container" container_id=container.id signal=signal
     docker_kill(container.id; signal=signal)
     container.status = :exited
     return container
@@ -466,7 +488,7 @@ Removes a container from the system. Returns `true` if successful.
 """
 function remove!(container::Container; force::Bool=false)::Bool
     # Remove container logic.
-    @info "Removing container" container_id=container.id force=force
+    @debug "Removing container" container_id=container.id force=force
     docker_rm(container.id; force=force)
     container.cleaned_up = true
     container.status = :removed
@@ -500,7 +522,7 @@ Lists containers. If `all` is true, lists all containers; otherwise, only runnin
 """
 function ps(; all::Bool=true)::Vector{Container}
     # Query the underlying system for container info.
-    @info "Listing containers" all=all
+    @debug "Listing containers" all=all
     ids = docker_ps(; all=all)
     containers = Container[]
     for id in ids
