@@ -130,9 +130,11 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
     for (container_path, host_path) in volumes
         push!(args, "-v", string(host_path, ":", container_path))
     end
-    # Add environment variables.
-    for (key, val) in environment
-        push!(args, "-e", string(key, "=", val))
+    # Add environment variables. Only the *names* go on the command line
+    # (visible in the host's process list); the values travel via the docker
+    # CLI process environment, which `-e KEY` (without a value) forwards.
+    for (key, _) in environment
+        push!(args, "-e", key)
     end
     # Base image.
     push!(args, image_ref(image))
@@ -141,7 +143,7 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
         append!(args, command)
     end
     try
-        docker_read(args)
+        docker_read(args; env=isempty(environment) ? nothing : environment)
         return String(chomp(read(cidfile, String)))
     finally
         rm(cidfile; force=true)
@@ -251,8 +253,9 @@ function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractSt
         push!(args, "-w", String(workdir))
     end
     if env !== nothing
-        for (key, val) in env
-            push!(args, "-e", string(key, "=", val))
+        # names only on the command line; values via the CLI's environment
+        for (key, _) in env
+            push!(args, "-e", String(key))
         end
     end
     if env_file !== nothing
@@ -268,7 +271,9 @@ function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractSt
     for part in exec_cmd
         push!(args, String(part))
     end
-    return docker_read(args)
+    env_map = env === nothing ? nothing :
+        Dict{String, String}(String(k) => String(v) for (k, v) in env)
+    return docker_read(args; env=env_map)
 end
 
 """
