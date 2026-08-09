@@ -61,26 +61,24 @@ end
 mutable struct Container
     id::String                           # Unique container identifier
     image::Image                         # The image the container was launched from
-    status::Symbol                       # e.g., :created, :running, :stopped, :exited
+    status::Symbol                       # e.g., :created, :running, :stopped, :exited, :removed
     created_at::Union{DateTime, Nothing} # Timestamp of creation
     options::RunOptions                  # Options used when creating the container
+    cleaned_up::Bool                     # true once the container has been removed
 
-    function Container(id, image, symbol, created_at, options)
-        x = new(id, image, symbol, created_at, options)
-        finalizer(x) do _
+    function Container(id, image, status, created_at, options; managed::Bool=false)
+        x = new(id, image, status, created_at, options, false)
+        # Only containers started by Harbor (`managed=true`) get a cleanup
+        # finalizer; containers merely observed via `ps` must never be
+        # stopped or removed just because their in-memory handle was GC'd.
+        managed && finalizer(x) do c
+            c.cleaned_up && return
             # Must use @async because finalizers cannot perform task switches
             # (I/O operations like docker commands require task switches)
             @async try
-                ids = docker_ps(; all=true)
-                for cid in ids
-                    if cid == id
-                        docker_stop(cid)
-                        docker_rm(cid; force=true)
-                        break
-                    end
-                end
+                docker_rm(c.id; force=true)
             catch e
-                @debug "Container cleanup failed" exception=(e, catch_backtrace())
+                @debug "Container cleanup failed" container_id=c.id exception=(e, catch_backtrace())
             end
         end
         return x
@@ -210,7 +208,7 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     # Call underlying runtime to create and start the container.
     cid = docker_run(image; name=opts.name, ports=opts.ports, volumes=opts.volumes,
         environment=opts.environment, command=opts.command, detach=opts.detach)
-    cont = Container(cid, image, :running, now(), opts)
+    cont = Container(cid, image, :running, now(), opts; managed=true)
     if opts.wait_strategy !== nothing
         @info "Waiting for container to be ready using strategy $(opts.wait_strategy)"
         wait_for(cont)
