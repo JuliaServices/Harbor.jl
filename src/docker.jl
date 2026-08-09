@@ -110,7 +110,8 @@ Runs `docker run` with the provided options and returns the container ID.
 """
 function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                     volumes=Dict{String,String}(), environment=Dict{String,String}(),
-                    command=nothing, detach::Bool=false)::String
+                    command=nothing, detach::Bool=false,
+                    labels=Dict{String,String}())::String
     # The container id is communicated via --cidfile: `docker run` only prints
     # the id on stdout when detached; in the foreground case stdout is the
     # container's own output.
@@ -140,6 +141,10 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
     # CLI process environment, which `-e KEY` (without a value) forwards.
     for (key, _) in environment
         push!(args, "-e", key)
+    end
+    # Add labels.
+    for (key, val) in labels
+        push!(args, "--label", string(key, "=", val))
     end
     # Base image.
     push!(args, image_ref(image))
@@ -182,13 +187,16 @@ function _parse_network_ports(info)::Dict{Int, Int}
 end
 
 """
-    docker_ps(; all::Bool=false) -> Vector{String}
+    docker_ps(; all::Bool=false, label=nothing) -> Vector{String}
 
-Runs `docker ps` (or `docker ps -a` if all is true) and returns a vector of container IDs.
+Runs `docker ps` (or `docker ps -a` if all is true) and returns a vector of
+container IDs, optionally filtered to containers carrying the given
+`label` (a `"key"` or `"key=value"` string).
 """
-function docker_ps(; all::Bool=false)::Vector{String}
+function docker_ps(; all::Bool=false, label::Union{Nothing, String}=nothing)::Vector{String}
     args = ["ps", "--no-trunc", "--format", "{{.ID}}"]
     all && push!(args, "-a")
+    label !== nothing && push!(args, "--filter", "label=" * label)
     output = docker_read(args)
     return String[line for line in split(output, "\n") if !isempty(line)]
 end

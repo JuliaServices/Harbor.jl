@@ -114,6 +114,10 @@ normalize_wait_strategy(other) =
     wait_strategy::Union{Nothing, WaitStrategy} = nothing
 end
 
+# Label applied to every container started by Harbor, so leaked containers
+# can be identified (and removed via `prune`).
+const HARBOR_LABEL = "org.juliaservices.harbor"
+
 mutable struct Container
     id::String                           # Unique container identifier
     image::Image                         # The image the container was launched from
@@ -310,9 +314,11 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
         wait_strategy = WaitForPort((Int(first(keys(ports))),))
     end
     opts = RunOptions(; ports, wait_strategy, kw...)
-    # Call underlying runtime to create and start the container.
+    # Call underlying runtime to create and start the container. The label
+    # marks the container as Harbor-managed so `prune` can find leaked ones.
     cid = docker_run(image; name=opts.name, ports=opts.ports, volumes=opts.volumes,
-        environment=opts.environment, command=opts.command, detach=opts.detach)
+        environment=opts.environment, command=opts.command, detach=opts.detach,
+        labels=Dict(HARBOR_LABEL => "true"))
     # Resolve the actual host ports (ephemeral requests may differ from the
     # requested mapping).
     resolved_ports = isempty(opts.ports) ? Dict{Int, Int}() : try
@@ -393,6 +399,64 @@ function stop!(container::Container; timeout::Int=10)::Container
     docker_stop(container.id; timeout=timeout)
     container.status = :stopped
     return container
+end
+
+"""
+    start!(container::Container) -> Container
+
+Starts a stopped container. Returns the `Container` with an updated status
+and refreshed host port mappings (ephemeral ports may be re-assigned).
+"""
+function start!(container::Container)::Container
+    @info "Starting container" container_id=container.id
+    docker_start(container.id)
+    container.status = :running
+    isempty(container.options.ports) || (container.ports = docker_resolved_ports(container.id))
+    return container
+end
+
+"""
+    restart!(container::Container; timeout::Int=10) -> Container
+
+Restarts a container (stopping it first if running, with `timeout` seconds of
+grace). Returns the `Container` with an updated status and refreshed host
+port mappings.
+"""
+function restart!(container::Container; timeout::Int=10)::Container
+    @info "Restarting container" container_id=container.id timeout=timeout
+    docker_restart(container.id; timeout=timeout)
+    container.status = :running
+    isempty(container.options.ports) || (container.ports = docker_resolved_ports(container.id))
+    return container
+end
+
+"""
+    kill!(container::Container; signal="SIGKILL") -> Container
+
+Sends `signal` to the container's main process (default `SIGKILL`).
+Returns the `Container` with an updated status.
+"""
+function kill!(container::Container; signal::Union{String, Int}="SIGKILL")::Container
+    @info "Killing container" container_id=container.id signal=signal
+    docker_kill(container.id; signal=signal)
+    container.status = :exited
+    return container
+end
+
+"""
+    is_running(container::Container) -> Bool
+
+Queries docker for the container's live state. Returns `false` if the
+container no longer exists.
+"""
+function is_running(container::Container)::Bool
+    info = try
+        docker_inspect_container(container.id)
+    catch e
+        e isa DockerError && return false
+        rethrow()
+    end
+    return get(get(info, "State", Dict{String, Any}()), "Running", false) === true
 end
 
 """
@@ -490,6 +554,26 @@ function ps(; all::Bool=true)::Vector{Container}
 end
 
 """
+    prune() -> Int
+
+Force-removes **all** containers on the host that were started by Harbor
+(identified by the `$HARBOR_LABEL` label), including ones leaked by
+crashed or killed Julia processes. Returns the number of containers removed.
+Containers not started by Harbor are never touched.
+"""
+function prune()::Int
+    ids = docker_ps(; all=true, label=HARBOR_LABEL * "=true")
+    for id in ids
+        try
+            docker_rm(id; force=true)
+        catch e
+            @debug "Failed to prune container" container_id=id exception=(e, catch_backtrace())
+        end
+    end
+    return length(ids)
+end
+
+"""
 with_container(image::Image; kw...) do container
     # operations on container
 end
@@ -522,6 +606,7 @@ function with_container(f::Function, image::Image; container_logs_on_error::Bool
     end
 end
 
-with_container(f::Function, image::String; tag="latest", kw...) = with_container(f, pull(image; tag=tag); kw...)
+with_container(f::Function, image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) =
+    with_container(f, pull(String(image); tag); kw...)
 
 end
