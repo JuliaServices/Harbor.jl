@@ -91,7 +91,11 @@ Runs `docker run` with the provided options and returns the container ID.
 function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                     volumes=Dict{String,String}(), environment=Dict{String,String}(),
                     command=nothing, detach::Bool=false)::String
-    args = ["run"]
+    # The container id is communicated via --cidfile: `docker run` only prints
+    # the id on stdout when detached; in the foreground case stdout is the
+    # container's own output.
+    cidfile = tempname()
+    args = ["run", "--cidfile", cidfile]
     if detach
         push!(args, "-d")
     end
@@ -116,7 +120,12 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
     if command !== nothing
         append!(args, command)
     end
-    return chomp(docker_read(args))
+    try
+        docker_read(args)
+        return String(chomp(read(cidfile, String)))
+    finally
+        rm(cidfile; force=true)
+    end
 end
 
 """

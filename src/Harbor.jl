@@ -208,7 +208,8 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     # Call underlying runtime to create and start the container.
     cid = docker_run(image; name=opts.name, ports=opts.ports, volumes=opts.volumes,
         environment=opts.environment, command=opts.command, detach=opts.detach)
-    cont = Container(cid, image, :running, now(), opts; managed=true)
+    # A foreground (detach=false) run only returns once the container exits.
+    cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts; managed=true)
     if opts.wait_strategy !== nothing
         @info "Waiting for container to be ready using strategy $(opts.wait_strategy)"
         wait_for(cont)
