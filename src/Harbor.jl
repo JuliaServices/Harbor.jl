@@ -71,10 +71,36 @@ function remove(image::Image; force::Bool=false)::Bool
 end
 
 const WaitForPort = @NamedTuple{port::Int}
-const WaitForLog = @NamedTuple{pattern::String}
+const WaitForLog = @NamedTuple{pattern::Union{String, Regex}}
 const WaitForHTTP = @NamedTuple{url::String, expected_status::Int}
+const WaitForHealthy = @NamedTuple{healthy::Bool}
 const CustomWait = @NamedTuple{check::Function}
-const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, CustomWait}
+const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, WaitForHealthy, CustomWait}
+
+# Validate and canonicalize a user-provided wait strategy. Accepts the
+# documented NamedTuple shapes (with any field order / integer types) or a
+# bare function treated as a custom check, throwing a descriptive error for
+# anything else (previously an unrecognized strategy silently looped until
+# the wait timeout expired).
+normalize_wait_strategy(::Nothing) = nothing
+normalize_wait_strategy(f::Function) = CustomWait((f,))
+function normalize_wait_strategy(s::NamedTuple)
+    if length(s) == 1 && haskey(s, :port)
+        return WaitForPort((Int(s.port),))
+    elseif length(s) == 1 && haskey(s, :pattern)
+        return WaitForLog((s.pattern,))
+    elseif length(s) == 2 && haskey(s, :url) && haskey(s, :expected_status)
+        return WaitForHTTP((String(s.url), Int(s.expected_status)))
+    elseif length(s) == 1 && haskey(s, :healthy)
+        return WaitForHealthy((Bool(s.healthy),))
+    elseif length(s) == 1 && haskey(s, :check)
+        return CustomWait((s.check,))
+    end
+    throw(ArgumentError("unrecognized wait_strategy $s; expected (port=...,), (pattern=...,), " *
+                        "(url=..., expected_status=...), (healthy=true,), (check=...,), or a function"))
+end
+normalize_wait_strategy(other) =
+    throw(ArgumentError("wait_strategy must be a NamedTuple or a function, got $(typeof(other))"))
 
 @kwdef struct RunOptions
     name::Union{Nothing, String} = nothing
@@ -170,53 +196,99 @@ function Base.show(io::IO, container::Container)
 end
 
 """
+    WaitTimeoutError(strategy, timeout, logs)
+
+Thrown when a container fails to satisfy its wait strategy within
+`wait_timeout` seconds. Carries the container's logs at the time the wait
+gave up to make failures diagnosable.
+"""
+struct WaitTimeoutError <: Exception
+    strategy::WaitStrategy
+    timeout::Float64
+    logs::String
+end
+
+function Base.showerror(io::IO, e::WaitTimeoutError)
+    print(io, "WaitTimeoutError: container did not satisfy wait strategy ",
+          e.strategy, " within ", e.timeout, " seconds")
+    if !isempty(strip(e.logs))
+        print(io, "\ncontainer logs:\n", rstrip(e.logs))
+    end
+end
+
+# Parse "http://host[:port][/path]" into (host, port, path).
+function _parse_http_url(url::AbstractString)
+    m = match(r"^http://([^/:]+)(?::(\d+))?(/.*)?$", url)
+    m === nothing && throw(ArgumentError("WaitForHTTP only supports plain http://host[:port][/path] URLs, got: $url"))
+    host = String(m.captures[1])
+    port = m.captures[2] === nothing ? 80 : parse(Int, m.captures[2])
+    path = m.captures[3] === nothing ? "/" : String(m.captures[3])
+    return host, port, path
+end
+
+# One readiness probe per strategy; returns true when the condition holds.
+function check_wait_strategy(s::WaitForPort, container::Container)
+    hp = get(container.options.ports, s.port, nothing)
+    hp === nothing && throw(ArgumentError("wait strategy (port=$(s.port),) has no matching entry in the container's port mappings"))
+    try
+        close(connect("127.0.0.1", hp))
+        return true
+    catch
+        return false  # port is not yet open
+    end
+end
+
+check_wait_strategy(s::WaitForLog, container::Container) =
+    occursin(s.pattern, docker_logs(container.id; follow=false, tail="all"))
+
+function check_wait_strategy(s::WaitForHTTP, container::Container)
+    host, port, path = _parse_http_url(s.url)
+    try
+        sock = connect(host, port)
+        try
+            write(sock, "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n")
+            response = read(sock, String)
+            status_line = first(split(response, "\r\n"; limit=2))
+            parts = split(status_line, ' '; limit=3)
+            return length(parts) >= 2 && tryparse(Int, parts[2]) == s.expected_status
+        finally
+            close(sock)
+        end
+    catch
+        return false  # connection refused / reset while the server starts up
+    end
+end
+
+function check_wait_strategy(s::WaitForHealthy, container::Container)
+    s.healthy || return true
+    info = docker_inspect_container(container.id)
+    health = get(get(info, "State", Dict{String, Any}()), "Health", nothing)
+    health === nothing && throw(ArgumentError("wait strategy (healthy=true,) requires the image to define a HEALTHCHECK, but the container has none"))
+    return get(health, "Status", "") == "healthy"
+end
+
+check_wait_strategy(s::CustomWait, container::Container) = s.check(container) === true
+
+"""
     wait_for(container::Container)
 
-Waits until the given strategy condition is met or the timeout expires.
-Throws an error if the wait condition isn't satisfied in time.
+Waits until the container's wait strategy condition is met or `wait_timeout`
+expires. Throws a [`WaitTimeoutError`](@ref) (including the container's logs)
+if the condition isn't satisfied in time.
 """
 function wait_for(container::Container)
-    start_time = time()
     strategy = container.options.wait_strategy
-    strategy === nothing && return
+    strategy === nothing && return nothing
+    start_time = time()
     while true
-        elapsed = time() - start_time
-        if elapsed > container.options.wait_timeout
-            throw(ErrorException("Wait strategy timeout exceeded"))
-        end
-        if strategy isa WaitForPort
-            host_port = container.options.ports[strategy.port]  # Assumes port mapping exists
-            try
-                sock = connect("127.0.0.1", host_port)
-                close(sock)
-                @info "Port $(strategy.port) is listening"
-                return true
+        check_wait_strategy(strategy, container) && return nothing
+        if time() - start_time > container.options.wait_timeout
+            logs_output = try
+                docker_logs(container.id; follow=false, tail="all")
             catch
-                # Port is not yet open
+                ""
             end
-        elseif strategy isa WaitForLog
-            logs_output = docker_logs(container.id; follow=false, tail="all")
-            if occursin(strategy.pattern, logs_output)
-                @info "Found log pattern: $(strategy.pattern)"
-                return true
-            end
-        elseif strategy isa WaitForHTTP
-            try
-                sock = connect(strategy.url)
-                write(sock, "GET / HTTP/1.0\r\n\r\n")
-                response = String(read(sock, String))
-                if occursin(string(strategy.expected_status), response)
-                    @info "HTTP endpoint $(strategy.url) responded with $(strategy.expected_status)"
-                    return true
-                end
-            catch
-                # HTTP request failed
-            end
-        elseif strategy isa CustomWait
-            if strategy.check(container)
-                @info "Custom wait condition satisfied"
-                return true
-            end
+            throw(WaitTimeoutError(strategy, container.options.wait_timeout, logs_output))
         end
         sleep(container.options.wait_interval)
     end
@@ -231,8 +303,10 @@ Starts a container from the provided `Image` with the specified options.
 Returns a `Container` instance reflecting the running state.
 """
 function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)::Container
+    ports = Dict{Int, Int}(ports)
+    wait_strategy = normalize_wait_strategy(wait_strategy)
     if wait_strategy === nothing && !isempty(ports)
-        wait_strategy = (port=first(keys(ports)),)
+        wait_strategy = WaitForPort((Int(first(keys(ports))),))
     end
     opts = RunOptions(; ports, wait_strategy, kw...)
     # Call underlying runtime to create and start the container.
@@ -242,7 +316,14 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts; managed=true)
     if opts.wait_strategy !== nothing
         @info "Waiting for container to be ready using strategy $(opts.wait_strategy)"
-        wait_for(cont)
+        try
+            wait_for(cont)
+        catch
+            # the caller never receives the container handle, so remove the
+            # container rather than leaking it
+            cleanup!(cont)
+            rethrow()
+        end
     end
     return cont
 end
