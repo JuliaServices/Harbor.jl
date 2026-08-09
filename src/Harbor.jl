@@ -261,14 +261,37 @@ function stop!(container::Container; timeout::Int=10)::Container
 end
 
 """
-remove!(container::Container) -> Bool
+remove!(container::Container; force::Bool=false) -> Bool
 
 Removes a container from the system. Returns `true` if successful.
 """
 function remove!(container::Container; force::Bool=false)::Bool
     # Remove container logic.
     @info "Removing container" container_id=container.id force=force
-    return docker_rm(container.id; force=force)
+    docker_rm(container.id; force=force)
+    container.cleaned_up = true
+    container.status = :removed
+    return true
+end
+
+"""
+    cleanup!(container::Container)
+
+Synchronously force-remove the container (stopping it if necessary). Safe to
+call multiple times; does nothing if the container was already removed via
+`remove!` or a previous `cleanup!`. Errors during removal are logged at debug
+level and otherwise ignored.
+"""
+function cleanup!(container::Container)
+    container.cleaned_up && return nothing
+    container.cleaned_up = true
+    try
+        docker_rm(container.id; force=true)
+    catch e
+        @debug "Container cleanup failed" container_id=container.id exception=(e, catch_backtrace())
+    end
+    container.status = :removed
+    return nothing
 end
 
 """
@@ -323,8 +346,14 @@ with_container(image::Image; kw...) do container
     # operations on container
 end
 
-Runs a container with the specified image and keyword options. The container is automatically
-stopped and removed after the block completes (even if an error occurs).
+Runs a container with the specified image and keyword options. The container is
+force-removed synchronously after the block completes (even if an error occurs),
+so by the time `with_container` returns, the container is gone and its name and
+ports are free for reuse. If a graceful shutdown is required, call `stop!` on
+the container at the end of the block.
+
+If `container_logs_on_error=true`, the container's logs are logged with `@error`
+before the block's exception is rethrown.
 """
 function with_container(f::Function, image::Image; container_logs_on_error::Bool=false, kw...)
     container = run!(image; kw...)
@@ -332,12 +361,16 @@ function with_container(f::Function, image::Image; container_logs_on_error::Bool
         return f(container)
     catch
         if container_logs_on_error
-            logs_output = docker_logs(container.id; follow=false, tail="all")
-            @error logs_output
+            logs_output = try
+                docker_logs(container.id; follow=false, tail="all")
+            catch e
+                "failed to fetch container logs: " * sprint(showerror, e)
+            end
+            @error "with_container block failed; container logs:\n" * logs_output
         end
         rethrow()
     finally
-        finalize(container)
+        cleanup!(container)
     end
 end
 
