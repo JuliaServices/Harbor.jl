@@ -6,6 +6,11 @@ for leftover in ["harbor-ps-safety-test", "harbor-wait-timeout-test", "harbor-na
     run(pipeline(ignorestatus(`docker rm -f $leftover`); stdout=devnull, stderr=devnull))
 end
 
+# Shared test images, pulled once (repeated pulls hammer Docker Hub's
+# anonymous rate limits on CI).
+const ALPINE = Harbor.pull("alpine"; tag="latest")
+const BUSYBOX = Harbor.pull("busybox"; tag="latest")
+
 @testset "Harbor" begin
 
     # Pure parsing tests (no docker required).
@@ -44,7 +49,7 @@ end
 
     # Pull an image and verify its properties.
     @testset "pull" begin
-        img = Harbor.pull("alpine"; tag="latest")
+        img = ALPINE
         @test isa(img, Harbor.Image)
         @test img.name == "alpine"
         @test img.tag == "latest"
@@ -68,7 +73,7 @@ end
 
     # Run a container and exercise the whole lifecycle.
     @testset "run!, exec, logs, lifecycle" begin
-        img = Harbor.pull("alpine"; tag="latest")
+        img = ALPINE
         cont = Harbor.run!(img; command=["sleep", "60"])
         @test isa(cont, Harbor.Container)
         @test cont.status == :running
@@ -119,7 +124,7 @@ end
     end
 
     @testset "run! with detach=false records the real container id" begin
-        img = Harbor.pull("alpine")
+        img = ALPINE
         cont = Harbor.run!(img; command=["echo", "hello-foreground"], detach=false)
         @test occursin(r"^[0-9a-f]{64}$", cont.id)
         @test cont.status == :exited
@@ -129,7 +134,7 @@ end
 
     # ps must observe containers without ever managing (or destroying) them.
     @testset "ps observes but never manages containers" begin
-        img = Harbor.pull("alpine")
+        img = ALPINE
         tmp = mktempdir()
         cont = Harbor.run!(img; name="harbor-ps-safety-test", command=["sleep", "60"],
                            volumes=Dict("/harbor-data" => tmp),
@@ -161,7 +166,7 @@ end
     end
 
     @testset "ephemeral ports and host_port" begin
-        img = Harbor.pull("busybox")
+        img = BUSYBOX
         Harbor.with_container(img; command=["httpd", "-f", "-p", "8080"],
                               ports=Dict(8080 => 0), wait_timeout=30.0) do cont
             hp = Harbor.host_port(cont, 8080)
@@ -177,7 +182,7 @@ end
     end
 
     @testset "wait strategies" begin
-        img = Harbor.pull("busybox")
+        img = BUSYBOX
         # HTTP wait strategy end-to-end (fixed host port so the URL is known upfront)
         Harbor.with_container(img; command=["httpd", "-f", "-p", "8080"],
                               ports=Dict(8080 => 18080),
@@ -187,7 +192,7 @@ end
         end
 
         # log wait matches both stdout and stderr, and accepts Regex
-        result = Harbor.with_container("alpine";
+        result = Harbor.with_container(ALPINE;
             command=["sh", "-c", "echo stdout-ready; echo stderr-ready >&2; sleep 30"],
             wait_strategy=(pattern=r"stderr-ready",),
             wait_timeout=15.0) do cont
@@ -200,7 +205,7 @@ end
 
         # a bare function is a custom wait strategy
         checked = Ref(false)
-        Harbor.with_container("alpine"; command=["sleep", "30"],
+        Harbor.with_container(ALPINE; command=["sleep", "30"],
                               wait_strategy=c -> (checked[] = true)) do cont
             @test checked[]
         end
@@ -217,7 +222,7 @@ end
     end
 
     @testset "wait timeout removes the container and reports logs" begin
-        img = Harbor.pull("alpine")
+        img = ALPINE
         err = try
             Harbor.run!(img; name="harbor-wait-timeout-test",
                         command=["sh", "-c", "echo some-log-line; sleep 60"],
@@ -236,7 +241,7 @@ end
     end
 
     @testset "with_container cleans up synchronously" begin
-        img = Harbor.pull("alpine")
+        img = ALPINE
         local cid
         result = Harbor.with_container(img; command=["sleep", "60"]) do cont
             cid = cont.id
@@ -272,7 +277,7 @@ end
     end
 
     @testset "environment values reach the container" begin
-        Harbor.with_container("alpine"; command=["sleep", "30"],
+        Harbor.with_container(ALPINE; command=["sleep", "30"],
                               environment=Dict("SECRET_VALUE" => "hunter2")) do cont
             @test chomp(Harbor.exec(cont, ["sh", "-c", "echo -n \$SECRET_VALUE"])) == "hunter2"
         end
@@ -293,7 +298,7 @@ end
     end
 
     @testset "prune" begin
-        img = Harbor.pull("alpine")
+        img = ALPINE
         c1 = Harbor.run!(img; command=["sleep", "60"])
         c2 = Harbor.run!(img; command=["sleep", "60"])
         n = Harbor.prune()
@@ -307,8 +312,7 @@ end
 
     # Last: removing the image (containers referencing it are gone by now).
     @testset "remove image" begin
-        tmp_img = Harbor.pull("busybox"; tag="latest")
-        @test Harbor.remove(tmp_img; force=true)
+        @test Harbor.remove(BUSYBOX; force=true)
         @test !any(i -> i.name == "busybox" && i.tag == "latest", Harbor.images())
     end
 

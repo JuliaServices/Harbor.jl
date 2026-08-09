@@ -104,9 +104,12 @@ end
 """
     docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                volumes=Dict{String,String}(), environment=Dict{String,String}(),
-               command=nothing, detach::Bool=false) -> String
+               command=nothing, detach::Bool=false,
+               labels=Dict{String,String}()) -> String
 
 Runs `docker run` with the provided options and returns the container ID.
+`ports` maps container ports to host ports (a host port of 0 requests an
+OS-assigned ephemeral port); `labels` attaches `--label key=value` pairs.
 """
 function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                     volumes=Dict{String,String}(), environment=Dict{String,String}(),
