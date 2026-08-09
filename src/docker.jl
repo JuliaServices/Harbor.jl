@@ -122,9 +122,14 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
     if name !== nothing
         push!(args, "--name", name)
     end
-    # Add port mappings.
+    # Add port mappings. A host port of 0 publishes the container port to an
+    # ephemeral host port chosen by the OS.
     for (container_port, host_port) in ports
-        push!(args, "-p", string(host_port, ":", container_port))
+        if host_port == 0
+            push!(args, "-p", string(container_port))
+        else
+            push!(args, "-p", string(host_port, ":", container_port))
+        end
     end
     # Add volume mounts.
     for (container_path, host_path) in volumes
@@ -148,6 +153,32 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
     finally
         rm(cidfile; force=true)
     end
+end
+
+"""
+    docker_resolved_ports(container_id::String) -> Dict{Int, Int}
+
+Queries the actual container port => host port mappings of a (running)
+container via `docker inspect`, including ephemeral host ports assigned by
+the OS.
+"""
+function docker_resolved_ports(container_id::String)::Dict{Int, Int}
+    return _parse_network_ports(docker_inspect_container(container_id))
+end
+
+# Extract container port => host port mappings from a parsed `docker inspect`
+# result's NetworkSettings.
+function _parse_network_ports(info)::Dict{Int, Int}
+    ports = Dict{Int, Int}()
+    for (k, v) in something(get(get(info, "NetworkSettings", Dict{String, Any}()), "Ports", nothing), Dict{String, Any}())
+        # key is like "8080/tcp"; value is null (or empty) for unpublished ports
+        (v === nothing || isempty(v)) && continue
+        container_port = tryparse(Int, first(split(k, "/")))
+        host_port = tryparse(Int, string(get(v[1], "HostPort", "")))
+        (container_port === nothing || host_port === nothing) && continue
+        ports[container_port] = host_port
+    end
+    return ports
 end
 
 """

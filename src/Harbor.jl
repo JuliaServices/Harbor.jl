@@ -120,10 +120,11 @@ mutable struct Container
     status::Symbol                       # e.g., :created, :running, :stopped, :exited, :removed
     created_at::Union{DateTime, Nothing} # Timestamp of creation
     options::RunOptions                  # Options used when creating the container
+    ports::Dict{Int, Int}                # Resolved container port => host port mappings
     cleaned_up::Bool                     # true once the container has been removed
 
-    function Container(id, image, status, created_at, options; managed::Bool=false)
-        x = new(id, image, status, created_at, options, false)
+    function Container(id, image, status, created_at, options, ports=Dict{Int, Int}(); managed::Bool=false)
+        x = new(id, image, status, created_at, options, ports, false)
         # Only containers started by Harbor (`managed=true`) get a cleanup
         # finalizer; containers merely observed via `ps` must never be
         # stopped or removed just because their in-memory handle was GC'd.
@@ -159,12 +160,12 @@ function Base.show(io::IO, container::Container)
         println(io, "    Name: (none)")
     end
 
-    # Ports
+    # Ports (resolved mappings, including ephemeral host port assignments)
     println(io, "    Ports:")
-    if isempty(container.options.ports)
+    if isempty(container.ports)
         println(io, "      (none)")
     else
-        for (cport, hport) in container.options.ports
+        for (cport, hport) in container.ports
             println(io, "      Container Port ", cport, " -> Host Port ", hport)
         end
     end
@@ -228,7 +229,7 @@ end
 
 # One readiness probe per strategy; returns true when the condition holds.
 function check_wait_strategy(s::WaitForPort, container::Container)
-    hp = get(container.options.ports, s.port, nothing)
+    hp = get(container.ports, s.port, nothing)
     hp === nothing && throw(ArgumentError("wait strategy (port=$(s.port),) has no matching entry in the container's port mappings"))
     try
         close(connect("127.0.0.1", hp))
@@ -312,8 +313,16 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     # Call underlying runtime to create and start the container.
     cid = docker_run(image; name=opts.name, ports=opts.ports, volumes=opts.volumes,
         environment=opts.environment, command=opts.command, detach=opts.detach)
+    # Resolve the actual host ports (ephemeral requests may differ from the
+    # requested mapping).
+    resolved_ports = isempty(opts.ports) ? Dict{Int, Int}() : try
+        docker_resolved_ports(cid)
+    catch e
+        @debug "Failed to resolve container ports" container_id=cid exception=(e, catch_backtrace())
+        copy(opts.ports)
+    end
     # A foreground (detach=false) run only returns once the container exits.
-    cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts; managed=true)
+    cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts, resolved_ports; managed=true)
     if opts.wait_strategy !== nothing
         @info "Waiting for container to be ready using strategy $(opts.wait_strategy)"
         try
@@ -328,7 +337,21 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     return cont
 end
 
-run!(image; tag::String="latest", kw...) = run!(pull(image; tag=tag); kw...)
+run!(image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) = run!(pull(String(image); tag); kw...)
+
+"""
+    host_port(container::Container, container_port::Integer) -> Int
+
+Returns the host port that `container_port` is published on. This is the
+canonical way to reach a container whose ports were requested with an
+ephemeral host port (`ports=Dict(container_port => 0)`). Throws an
+`ArgumentError` if the container port is not published.
+"""
+function host_port(container::Container, container_port::Integer)::Int
+    hp = get(container.ports, Int(container_port), nothing)
+    hp === nothing && throw(ArgumentError("container port $container_port is not published to a host port (published: $(container.ports))"))
+    return hp
+end
 
 """
 inspect(container::Container) -> Dict
@@ -458,7 +481,9 @@ function ps(; all::Bool=true)::Vector{Container}
             length(kv) == 2 && (environment[String(kv[1])] = String(kv[2]))
         end
         command = String[string(x) for x in something(get(config, "Cmd", nothing), [])]
-        cont = Container(id, image, status, created_at, RunOptions(; name, ports, volumes, environment, command))
+        cont = Container(id, image, status, created_at,
+            RunOptions(; name, ports, volumes, environment, command),
+            _parse_network_ports(info))
         push!(containers, cont)
     end
     return containers
