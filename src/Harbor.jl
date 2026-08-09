@@ -336,37 +336,48 @@ function ps(; all::Bool=true)::Vector{Container}
     ids = docker_ps(; all=all)
     containers = Container[]
     for id in ids
-        info = docker_inspect_container(id)
-        # get image from inspect result
-        img = get(get(info, "Config", Dict()), "Image", "unknown")
-        tag = get(get(info, "Config", Dict()), "Tag", "unknown")
-        image = Image(img, tag)
-        status = Symbol(get(get(info, "State", Dict()), "Status", "unknown"))
-        created_at = get(info, "Created", nothing)
-        if created_at !== nothing
-            created_at = DateTime(created_at[1:min(sizeof(created_at), 23)])
+        # a container can vanish between the ps listing and the inspect call
+        info = try
+            docker_inspect_container(id)
+        catch e
+            e isa DockerError && continue
+            rethrow()
         end
-        # run options
+        config = get(info, "Config", Dict{String, Any}())
+        hostconfig = get(info, "HostConfig", Dict{String, Any}())
+        img_name, img_tag, img_digest = _split_ref(get(config, "Image", "unknown"))
+        image = Image(img_name, something(img_tag, "latest"), img_digest)
+        status = Symbol(get(get(info, "State", Dict{String, Any}()), "Status", "unknown"))
+        created_raw = get(info, "Created", nothing)
+        # e.g. "2026-08-09T12:34:56.789123456Z": keep millisecond precision
+        created_at = created_raw isa AbstractString ?
+            tryparse(DateTime, created_raw[1:min(sizeof(created_raw), 23)]) : nothing
+        # inspect reports names with a leading '/'
         name = get(info, "Name", nothing)
+        name isa AbstractString && (name = String(lstrip(name, '/')))
         ports = Dict{Int, Int}()
-        for (k, v) in get(get(info, "HostConfig", Dict()), "PortBindings", Dict())
-            # key is like: "80/tcp"
-            ports[parse(Int, split(k, "/")[1])] = parse(Int, v[1]["HostPort"])
+        for (k, v) in something(get(hostconfig, "PortBindings", nothing), Dict{String, Any}())
+            # key is like: "80/tcp"; value is null for unbound exposed ports
+            (v === nothing || isempty(v)) && continue
+            container_port = tryparse(Int, first(split(k, "/")))
+            host_port = tryparse(Int, string(get(v[1], "HostPort", "")))
+            (container_port === nothing || host_port === nothing) && continue
+            ports[container_port] = host_port
         end
         volumes = Dict{String, String}()
-        for (k, v) in something(get(get(info, "HostConfig", Dict()), "Binds", Dict()), Dict())
-            # key is like: "/host/path:/container/path"
-            volumes[split(k, ":")[2]] = split(v, ":")[1]
+        # Binds is an array of "/host/path:/container/path[:opts]" strings
+        for bind in something(get(hostconfig, "Binds", nothing), [])
+            parts = split(bind, ":")
+            length(parts) >= 2 || continue
+            volumes[String(parts[2])] = String(parts[1])
         end
-        env_vars = get(get(info, "Config", Dict()), "Env", String[])
         environment = Dict{String, String}()
-        for env in env_vars
-            key, val = split(env, "="; limit=2)
-            environment[key] = val
+        for env in something(get(config, "Env", nothing), [])
+            kv = split(env, "="; limit=2)
+            length(kv) == 2 && (environment[String(kv[1])] = String(kv[2]))
         end
-        command = String[x for x in get(get(info, "Config", Dict()), "Cmd", String[])]
-        detach = get(get(info, "HostConfig", Dict()), "NetworkMode", "default") == "bridge"
-        cont = Container(id, image, status, created_at, RunOptions(; name, ports, volumes, environment, command, detach))
+        command = String[string(x) for x in something(get(config, "Cmd", nothing), [])]
+        cont = Container(id, image, status, created_at, RunOptions(; name, ports, volumes, environment, command))
         push!(containers, cont)
     end
     return containers
