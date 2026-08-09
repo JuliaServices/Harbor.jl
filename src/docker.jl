@@ -1,12 +1,54 @@
 """
+    DockerError(cmd, exitcode, stderr)
+
+Exception thrown when a `docker` CLI invocation exits with a non-zero status.
+Carries the failed command, its exit code, and any captured stderr output.
+"""
+struct DockerError <: Exception
+    cmd::Cmd
+    exitcode::Int
+    stderr::String
+end
+
+function Base.showerror(io::IO, e::DockerError)
+    print(io, "DockerError: command ", e.cmd, " failed with exit code ", e.exitcode)
+    if !isempty(strip(e.stderr))
+        print(io, ":\n", rstrip(e.stderr))
+    end
+end
+
+# Run a docker CLI command, returning captured stdout as a String.
+# stderr is captured and included in the DockerError thrown on failure.
+# With `stderr_to_stdout=true`, stderr is merged into the returned output instead.
+function docker_read(args::Vector{String}; env=nothing, stderr_to_stdout::Bool=false)::String
+    cmd = Cmd(vcat(["docker"], args))
+    if env !== nothing
+        cmd = addenv(cmd, env)
+    end
+    out = IOBuffer()
+    err = stderr_to_stdout ? out : IOBuffer()
+    proc = try
+        run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
+    catch e
+        if e isa Base.IOError
+            throw(ArgumentError("could not run the `docker` CLI — is Docker installed and on the PATH?"))
+        end
+        rethrow()
+    end
+    output = String(take!(out))
+    if !success(proc)
+        throw(DockerError(cmd, proc.exitcode, stderr_to_stdout ? output : String(take!(err))))
+    end
+    return output
+end
+
+"""
     docker_pull(image_name::String; tag::String="latest") -> Image
 
 Runs `docker pull <image_name>:<tag>`. On success, returns an `Image` struct.
 """
 function docker_pull(image_name::String; tag::String="latest")::Image
-    image_ref = string(image_name, ":", tag)
-    cmd = Cmd(["docker", "pull", image_ref])
-    run(cmd)  # Throws on non-zero status.
+    docker_read(["pull", string(image_name, ":", tag)])
     return Image(image_name, tag, nothing)
 end
 
@@ -16,18 +58,14 @@ end
 Runs `docker images` and returns a vector of `Image` structs.
 """
 function docker_images()::Vector{Image}
-    cmd = Cmd(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"])
-    output = read(cmd, String)
-    images = String[]
+    output = docker_read(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+    images = Image[]
     for line in split(output, "\n")
-        if !isempty(line)
-            push!(images, line)
-        end
+        isempty(line) && continue
+        parts = split(line, ":")
+        push!(images, Image(String(parts[1]), String(parts[2]), nothing))
     end
-    # Parse each line into an Image.
-    return [let parts = split(img, ":")
-            Image(parts[1], parts[2], nothing)
-          end for img in images]
+    return images
 end
 
 """
@@ -36,13 +74,10 @@ end
 Runs `docker rmi [--force] <image>`. Returns `true` on success.
 """
 function docker_rm_image(image::Image; force::Bool=false)::Bool
-    image_ref = string(image.name, ":", image.tag)
-    if force
-        cmd = Cmd(["docker", "rmi", "--force", image_ref])
-    else
-        cmd = Cmd(["docker", "rmi", image_ref])
-    end
-    run(cmd)
+    args = ["rmi"]
+    force && push!(args, "--force")
+    push!(args, string(image.name, ":", image.tag))
+    docker_read(args)
     return true
 end
 
@@ -56,7 +91,7 @@ Runs `docker run` with the provided options and returns the container ID.
 function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                     volumes=Dict{String,String}(), environment=Dict{String,String}(),
                     command=nothing, detach::Bool=false)::String
-    args = String[]
+    args = ["run"]
     if detach
         push!(args, "-d")
     end
@@ -76,16 +111,12 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
         push!(args, "-e", string(key, "=", val))
     end
     # Base image.
-    image_ref = string(image.name, ":", image.tag)
-    push!(args, image_ref)
+    push!(args, string(image.name, ":", image.tag))
     # Append command if provided.
     if command !== nothing
         append!(args, command)
     end
-    # Build command using Cmd constructor.
-    cmd = Cmd(vcat(["docker", "run"], args))
-    container_id = chomp(read(cmd, String))
-    return container_id
+    return chomp(docker_read(args))
 end
 
 """
@@ -94,13 +125,10 @@ end
 Runs `docker ps` (or `docker ps -a` if all is true) and returns a vector of container IDs.
 """
 function docker_ps(; all::Bool=false)::Vector{String}
-    if all
-        cmd = Cmd(["docker", "ps", "--no-trunc", "-a", "--format", "{{.ID}}"])
-    else
-        cmd = Cmd(["docker", "ps", "--no-trunc", "--format", "{{.ID}}"])
-    end
-    output = read(cmd, String)
-    return [line for line in split(output, "\n") if !isempty(line)]
+    args = ["ps", "--no-trunc", "--format", "{{.ID}}"]
+    all && push!(args, "-a")
+    output = docker_read(args)
+    return String[line for line in split(output, "\n") if !isempty(line)]
 end
 
 """
@@ -109,31 +137,27 @@ end
 Runs `docker inspect <container_id>` and returns the parsed JSON.
 """
 function docker_inspect_container(container_id::String)
-    cmd = Cmd(["docker", "inspect", container_id])
-    output = read(cmd, String)
-    ret = JSON.parse(output)
-    return ret[1]
+    output = docker_read(["inspect", container_id])
+    return JSON.parse(output)[1]
 end
 
 """
     docker_stop(container_id::String; timeout::Int=10) -> Bool
 
-Runs `docker stop --timeout=<timeout> <container_id>`. Returns true if successful.
+Runs `docker stop -t <timeout> <container_id>`. Returns true if successful.
 """
 function docker_stop(container_id::String; timeout::Int=10)::Bool
-    cmd = Cmd(["docker", "stop", "--timeout=" * string(timeout), container_id])
-    run(cmd)
+    docker_read(["stop", "-t", string(timeout), container_id])
     return true
 end
 
 """
-    docker_kill(container_id::String; signal::Union{String,Int}="SIGTERM") -> Bool
+    docker_kill(container_id::String; signal::Union{String,Int}="SIGKILL") -> Bool
 
 Runs `docker kill --signal=<signal> <container_id>`. Returns true if successful.
 """
-function docker_kill(container_id::String; signal::Union{String,Int}="SIGTERM")::Bool
-    cmd = Cmd(["docker", "kill", "--signal=" * string(signal), container_id])
-    run(cmd)
+function docker_kill(container_id::String; signal::Union{String,Int}="SIGKILL")::Bool
+    docker_read(["kill", "--signal=" * string(signal), container_id])
     return true
 end
 
@@ -143,12 +167,10 @@ end
 Runs `docker rm [--force] <container_id>`. Returns true if the container is removed.
 """
 function docker_rm(container_id::String; force::Bool=false)::Bool
-    if force
-        cmd = Cmd(["docker", "rm", "--force", container_id])
-    else
-        cmd = Cmd(["docker", "rm", container_id])
-    end
-    run(cmd)
+    args = ["rm"]
+    force && push!(args, "--force")
+    push!(args, container_id)
+    docker_read(args)
     return true
 end
 
@@ -156,18 +178,13 @@ end
     docker_logs(container_id::String; follow::Bool=false, tail::Union{String,Int}="all") -> String
 
 Runs `docker logs` with optional follow and tail parameters, returning the log output.
+The container's stdout and stderr streams are merged in the returned string.
 """
 function docker_logs(container_id::String; follow::Bool=false, tail::Union{String,Int}="all")::String
-    args = String[]
-    if follow
-        push!(args, "-f")
-    end
-    push!(args, "--tail=" * string(tail))
-    push!(args, container_id)
-    cmd = Cmd(vcat(["docker", "logs"], args))
-    output = PipeBuffer()
-    run(pipeline(cmd; stdout=output, stderr=output))
-    return String(take!(output))
+    args = ["logs"]
+    follow && push!(args, "-f")
+    push!(args, "--tail=" * string(tail), container_id)
+    return docker_read(args; stderr_to_stdout=true)
 end
 
 """
@@ -179,7 +196,9 @@ end
                 user::Union{Nothing,AbstractString}=nothing,
                 workdir::Union{Nothing,AbstractString}=nothing) -> String
 
-Runs `docker exec` on the specified container. Returns the command output as a string.
+Runs `docker exec` on the specified container. Returns the command's stdout as a string.
+Throws a [`DockerError`](@ref) (carrying the exit code and captured stderr) if the
+command exits with a non-zero status.
 """
 function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractString};
                      detach::Bool=false, detach_keys::Union{Nothing,AbstractString}=nothing,
@@ -188,7 +207,7 @@ function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractSt
                      interactive::Bool=false, privileged::Bool=false, tty::Bool=false,
                      user::Union{Nothing,AbstractString}=nothing,
                      workdir::Union{Nothing,AbstractString}=nothing)::String
-    args = String[]
+    args = ["exec"]
     detach && push!(args, "-d")
     interactive && push!(args, "-i")
     tty && push!(args, "-t")
@@ -220,8 +239,7 @@ function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractSt
     for part in exec_cmd
         push!(args, String(part))
     end
-    cmd = Cmd(vcat(["docker", "exec"], args))
-    return read(cmd, String)
+    return docker_read(args)
 end
 
 """
@@ -230,18 +248,16 @@ end
 Runs `docker start <container_id>`. Returns true if successful.
 """
 function docker_start(container_id::String)::Bool
-    cmd = Cmd(["docker", "start", container_id])
-    run(cmd)
+    docker_read(["start", container_id])
     return true
 end
 
 """
     docker_restart(container_id::String; timeout::Int=10) -> Bool
 
-Runs `docker restart --timeout=<timeout> <container_id>`. Returns true if successful.
+Runs `docker restart -t <timeout> <container_id>`. Returns true if successful.
 """
 function docker_restart(container_id::String; timeout::Int=10)::Bool
-    cmd = Cmd(["docker", "restart", "--timeout=" * string(timeout), container_id])
-    run(cmd)
+    docker_read(["restart", "-t", string(timeout), container_id])
     return true
 end
