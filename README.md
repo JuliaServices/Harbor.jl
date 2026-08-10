@@ -54,6 +54,17 @@ Harbor.with_container("alpine") do container
 end
 ```
 
+Docker treats `rmi name@digest` as removal of the underlying image and all local
+tags that point to it. `Harbor.remove` keeps this behavior for digest-pinned
+images.
+
+### Environment variables
+
+`run!` and `exec` pass environment values through a mode-0600 temporary
+`--env-file`. Values do not appear in the Docker command line or alter the
+Docker CLI process environment. Container display redacts them. Docker's
+line-based env-file format does not support NUL, CR, or LF in names or values.
+
 ### Ports
 
 Map container ports to host ports with `ports`; use host port `0` to get an
@@ -94,14 +105,17 @@ Harbor.run!("myimage"; wait_strategy=(healthy=true,))
 Harbor.run!("myimage"; wait_strategy=c -> Harbor.is_running(c))
 ```
 
-If the strategy isn't satisfied within `wait_timeout` seconds, the container is
-removed and a `WaitTimeoutError` is thrown that includes the container's logs.
+If the strategy is not satisfied within `wait_timeout` seconds, Harbor removes
+the container and throws `WaitTimeoutError` with its logs. If the container
+exits first, Harbor removes it and throws `ContainerExitedError` with its logs.
 
 ### Cleanup
 
 Containers started by Harbor are labeled `org.juliaservices.harbor=true` and
 force-removed by a GC finalizer as a safety net. For deterministic cleanup use
-`with_container`, and to reap containers leaked by crashed processes:
+`with_container`. A cleanup failure after a successful block is thrown. If the
+block already failed, Harbor preserves that error and logs the cleanup failure.
+To reap containers leaked by crashed processes:
 
 ```julia
 Harbor.prune()  # force-removes all Harbor-started containers on the host

@@ -386,7 +386,8 @@ function check_wait_strategy(s::WaitForPort, container::Container; timeout::Real
         # (or the service already sent data).
         closed = @async try
             eof(sock)
-        catch
+        catch e
+            e isa InterruptException && rethrow()
             true  # reset/aborted counts as closed
         end
         survival = min(0.25, max(Float64(timeout), 0.001))
@@ -455,9 +456,10 @@ end
 
 # best-effort log fetch for wait failure errors
 function _logs_or_empty(container::Container)
-    try
+    return try
         docker_logs(container.id; follow=false, tail="all")
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         ""
     end
 end
@@ -546,6 +548,7 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     resolved_ports = isempty(opts.ports) ? Dict{Int, Int}() : try
         docker_resolved_ports(cid)
     catch e
+        e isa DockerError || rethrow()
         @debug "Failed to resolve container ports" container_id=cid exception=(e, catch_backtrace())
         Dict{Int, Int}(k => v for (k, v) in opts.ports if v != 0)
     end
@@ -714,21 +717,23 @@ end
 Synchronously force-remove the container (stopping it if necessary). Safe to
 call multiple times; does nothing if the container was already removed via
 `remove!` or a previous `cleanup!`. A failed removal leaves the handle eligible
-for another cleanup attempt. Errors are logged at debug level by default; set
-`throw_errors=true` to propagate them.
+for another cleanup attempt. Errors are logged as warnings by default; set
+`throw_errors=true` to propagate them. Otherwise, a warning identifies the
+container that may still exist.
 """
 function cleanup!(container::Container; throw_errors::Bool=false)
     container.cleaned_up && return nothing
     try
         docker_rm(container.id; force=true)
     catch e
+        e isa InterruptException && rethrow()
         if e isa DockerError && _is_missing_container_error(e)
             container.cleaned_up = true
             container.status = :removed
             return nothing
         end
         throw_errors && rethrow()
-        @debug "Container cleanup failed" container_id=container.id exception=(e, catch_backtrace())
+        @warn "Container cleanup failed; container may still exist" container_id=container.id exception=(e, catch_backtrace())
         return nothing
     end
     container.cleaned_up = true
@@ -820,7 +825,8 @@ function prune()::Int
             docker_rm(id; force=true)
             removed += 1
         catch e
-            @debug "Failed to prune container" container_id=id exception=(e, catch_backtrace())
+            e isa InterruptException && rethrow()
+            @warn "Failed to prune Harbor container; container may still exist" container_id=id exception=(e, catch_backtrace())
         end
     end
     return removed
@@ -839,6 +845,11 @@ the container at the end of the block.
 
 If `container_logs_on_error=true`, the container's logs are logged with `@error`
 before the block's exception is rethrown.
+
+If cleanup fails after a successful block, the cleanup error is thrown. If the
+block already raised an exception, Harbor preserves that original exception and
+logs a cleanup warning instead. The handle remains eligible for a later
+[`cleanup!`](@ref) attempt.
 """
 function with_container(f::Function, image::Image; container_logs_on_error::Bool=false, kw...)
     container = run!(image; kw...)

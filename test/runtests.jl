@@ -478,7 +478,9 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
                                                "harbor-missing-$TEST_RUN_SUFFIX.sock")
         withenv("DOCKER_HOST" => missing_socket) do
             @test_throws Harbor.DockerError Harbor.is_running(failed_cleanup)
-            @test Harbor.cleanup!(failed_cleanup) === nothing
+            @test_logs (:warn, r"Container cleanup failed") begin
+                @test Harbor.cleanup!(failed_cleanup) === nothing
+            end
             @test !failed_cleanup.cleaned_up
             @test failed_cleanup.status == :running
             @test_throws Harbor.DockerError Harbor.cleanup!(failed_cleanup;
