@@ -10,17 +10,84 @@ end
 
 Image(name::String, tag::String="latest") = Image(name, tag, nothing)
 
+# Split an image reference "name[:tag][@digest]" into its parts. A ':' only
+# counts as a tag separator when it appears after the last '/', so registry
+# hosts with ports ("localhost:5000/img") parse correctly.
+function _split_ref(ref::AbstractString)
+    name = ref
+    digest = nothing
+    i = findlast('@', name)
+    if i !== nothing
+        digest = String(name[i+1:end])
+        name = name[1:i-1]
+    end
+    slash = findlast('/', name)
+    colon = findlast(':', name)
+    tag = nothing
+    if colon !== nothing && (slash === nothing || colon > slash)
+        tag = String(name[colon+1:end])
+        name = name[1:colon-1]
+    end
+    return String(name), tag, digest
+end
+
 include("docker.jl")
 
 """
-pull(image::String; tag::String="latest") -> Image
+pull(image::String; tag::Union{Nothing, String}=nothing) -> Image
 
-Pulls an image from a registry and returns an `Image` instance.
+Pulls an image from a registry and returns an `Image` instance. `image` may be
+a bare name (`"alpine"`), include a tag (`"alpine:3.19"`), or be pinned to a
+digest (`"alpine@sha256:..."`). When no tag is given in either the reference or
+the `tag` keyword, `"latest"` is used. The returned `Image` records the
+image's registry digest when it can be determined.
 """
-function pull(image::String; tag::String="latest")::Image
-    @info "Pulling image" image tag=tag
+function pull(image::String; tag::Union{Nothing, String}=nothing)::Image
+    name, tag, digest = _check_ref(image, tag)
+    @debug "Pulling image" name tag digest
+    return docker_pull(name; tag, digest)
+end
+
+# Shared reference validation for pull/_resolve_image: returns (name, tag, digest)
+# with the effective tag resolved. Digest-pinned pulls create no local tag, so
+# their Image records an empty tag.
+function _check_ref(image::AbstractString, tag::Union{Nothing, String})
     isempty(image) && throw(ArgumentError("Image name cannot be empty"))
-    return docker_pull(image; tag=tag)
+    tag !== nothing && isempty(tag) && throw(ArgumentError("Image tag cannot be empty"))
+    name, ref_tag, digest = _split_ref(image)
+    isempty(name) && throw(ArgumentError("Image name cannot be empty"))
+    occursin('@', name) && throw(ArgumentError("Image reference can contain at most one '@' separator: $image"))
+    ref_tag !== nothing && isempty(ref_tag) && throw(ArgumentError("Image tag cannot be empty"))
+    if digest !== nothing
+        isempty(digest) && throw(ArgumentError("Image digest cannot be empty"))
+        digest_parts = split(digest, ':'; limit=2)
+        (length(digest_parts) == 2 && all(part -> !isempty(part), digest_parts)) ||
+            throw(ArgumentError("Image digest must have algorithm:value form, got $(repr(digest))"))
+        tag !== nothing && throw(ArgumentError("tag keyword cannot be combined with a digest-pinned image reference"))
+    end
+    if ref_tag !== nothing && tag !== nothing && ref_tag != tag
+        throw(ArgumentError("conflicting tags: image reference \"$image\" specifies tag \"$ref_tag\" but tag=\"$tag\" was also given"))
+    end
+    tag = digest === nothing ? something(ref_tag, tag, "latest") : ""
+    return String(name), tag, digest
+end
+
+# Resolve an image reference for run!/with_container: use the local image when
+# present, pulling only when it isn't. Keeps string-form calls usable offline
+# and avoids a registry round-trip (and Docker Hub rate-limit exposure) on
+# every call.
+function _resolve_image(image::AbstractString; tag::Union{Nothing, String}=nothing)::Image
+    name, etag, digest = _check_ref(image, tag)
+    ref = digest === nothing ? string(name, ":", etag) : string(name, "@", digest)
+    present = try
+        docker_read(["image", "inspect", "--format", "{{.Id}}", ref])
+        true
+    catch e
+        e isa DockerError || rethrow()
+        false
+    end
+    present && return Image(name, etag, digest)
+    return pull(String(image); tag)
 end
 
 """
@@ -34,17 +101,94 @@ images()::Vector{Image} = docker_images()
 remove(image::Image; force::Bool=false) -> Bool
 
 Removes the specified image.
+
+For a digest-pinned `Image` with no tag, Docker removes the underlying image
+and every local tag that points to it. This is Docker's `rmi name@digest`
+behavior; use digest removal only when deleting all such tags is intended.
 """
 function remove(image::Image; force::Bool=false)::Bool
-    @info "Removing image" image force
+    @debug "Removing image" image force
     return docker_rm_image(image; force=force)
 end
 
 const WaitForPort = @NamedTuple{port::Int}
-const WaitForLog = @NamedTuple{pattern::String}
+const WaitForLog = @NamedTuple{pattern::Union{String, Regex}}
 const WaitForHTTP = @NamedTuple{url::String, expected_status::Int}
+const WaitForHealthy = @NamedTuple{healthy::Bool}
 const CustomWait = @NamedTuple{check::Function}
-const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, CustomWait}
+const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, WaitForHealthy, CustomWait}
+
+# Validate and canonicalize a user-provided wait strategy. Accepts the
+# documented NamedTuple shapes (with any field order / integer types) or a
+# bare function treated as a custom check, throwing a descriptive error for
+# anything else (previously an unrecognized strategy silently looped until
+# the wait timeout expired).
+normalize_wait_strategy(::Nothing) = nothing
+normalize_wait_strategy(f::Function) = CustomWait((f,))
+
+function _port_number(value, description::AbstractString; allow_zero::Bool=false)::Int
+    if !(value isa Integer) || value isa Bool
+        throw(ArgumentError("$description must be an integer, got $(repr(value))"))
+    end
+    port = try
+        Int(value)
+    catch e
+        e isa InexactError || rethrow()
+        throw(ArgumentError("$description is outside the supported integer range: $(repr(value))"))
+    end
+    lower = allow_zero ? 0 : 1
+    lower <= port <= 65535 || throw(ArgumentError("$description must be between $lower and 65535, got $port"))
+    return port
+end
+
+function normalize_wait_strategy(s::NamedTuple)
+    if length(s) == 1 && haskey(s, :port) && s.port isa Integer && !(s.port isa Bool)
+        return WaitForPort((_port_number(s.port, "wait strategy port"),))
+    elseif length(s) == 1 && haskey(s, :pattern) && s.pattern isa Union{AbstractString, Regex}
+        return WaitForLog((s.pattern isa Regex ? s.pattern : String(s.pattern),))
+    elseif length(s) == 2 && haskey(s, :url) && haskey(s, :expected_status) &&
+           s.url isa AbstractString && s.expected_status isa Integer &&
+           !(s.expected_status isa Bool)
+        status = try
+            Int(s.expected_status)
+        catch e
+            e isa InexactError || rethrow()
+            throw(ArgumentError("expected HTTP status is outside the supported integer range: $(repr(s.expected_status))"))
+        end
+        100 <= status <= 599 || throw(ArgumentError("expected HTTP status must be between 100 and 599, got $status"))
+        url = String(s.url)
+        _parse_http_url(url)
+        return WaitForHTTP((url, status))
+    elseif length(s) == 1 && haskey(s, :healthy) && s.healthy === true
+        return WaitForHealthy((true,))
+    elseif length(s) == 1 && haskey(s, :check) && s.check isa Function
+        return CustomWait((s.check,))
+    end
+    throw(ArgumentError("unrecognized wait_strategy $s; expected (port=...,), (pattern=...,), " *
+                        "(url=..., expected_status=...), (healthy=true,), (check=...,), or a function"))
+end
+normalize_wait_strategy(other) =
+    throw(ArgumentError("wait_strategy must be a NamedTuple or a function, got $(typeof(other))"))
+
+function _normalize_ports(ports)::Dict{Int, Int}
+    normalized = Dict{Int, Int}()
+    for (container_port, host_port) in ports
+        container_port = _port_number(container_port, "container port")
+        host_port = _port_number(host_port, "host port"; allow_zero=true)
+        haskey(normalized, container_port) &&
+            throw(ArgumentError("container port $container_port is mapped more than once"))
+        normalized[container_port] = host_port
+    end
+    return normalized
+end
+
+function _validate_wait_timing(wait_timeout::Float64, wait_interval::Float64)
+    isfinite(wait_timeout) && wait_timeout >= 0 ||
+        throw(ArgumentError("wait_timeout must be finite and non-negative, got $wait_timeout"))
+    isfinite(wait_interval) && wait_interval > 0 ||
+        throw(ArgumentError("wait_interval must be finite and positive, got $wait_interval"))
+    return nothing
+end
 
 @kwdef struct RunOptions
     name::Union{Nothing, String} = nothing
@@ -58,29 +202,32 @@ const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, CustomWait}
     wait_strategy::Union{Nothing, WaitStrategy} = nothing
 end
 
+# Label applied to every container started by Harbor, so leaked containers
+# can be identified (and removed via `prune`).
+const HARBOR_LABEL = "org.juliaservices.harbor"
+
 mutable struct Container
     id::String                           # Unique container identifier
     image::Image                         # The image the container was launched from
-    status::Symbol                       # e.g., :created, :running, :stopped, :exited
+    status::Symbol                       # e.g., :created, :running, :stopped, :exited, :removed
     created_at::Union{DateTime, Nothing} # Timestamp of creation
     options::RunOptions                  # Options used when creating the container
+    ports::Dict{Int, Int}                # Resolved container port => host port mappings
+    cleaned_up::Bool                     # true once the container has been removed
 
-    function Container(id, image, symbol, created_at, options)
-        x = new(id, image, symbol, created_at, options)
-        finalizer(x) do _
+    function Container(id, image, status, created_at, options, ports=Dict{Int, Int}(); managed::Bool=false)
+        x = new(id, image, status, created_at, options, ports, false)
+        # Only containers started by Harbor (`managed=true`) get a cleanup
+        # finalizer; containers merely observed via `ps` must never be
+        # stopped or removed just because their in-memory handle was GC'd.
+        managed && finalizer(x) do c
+            c.cleaned_up && return
             # Must use @async because finalizers cannot perform task switches
             # (I/O operations like docker commands require task switches)
             @async try
-                ids = docker_ps(; all=true)
-                for cid in ids
-                    if cid == id
-                        docker_stop(cid)
-                        docker_rm(cid; force=true)
-                        break
-                    end
-                end
+                docker_rm(c.id; force=true)
             catch e
-                @debug "Container cleanup failed" exception=(e, catch_backtrace())
+                @debug "Container cleanup failed" container_id=c.id exception=(e, catch_backtrace())
             end
         end
         return x
@@ -90,14 +237,18 @@ end
 function Base.show(io::IO, container::Container)
     println(io, "Container:")
     println(io, "  ID: ", container.id)
-    println(io, "  Image: ", container.image.name, ":", container.image.tag)
+    if isempty(container.image.tag)
+        println(io, "  Image: ", container.image.name)
+    else
+        println(io, "  Image: ", container.image.name, ":", container.image.tag)
+    end
     if container.image.digest !== nothing
         println(io, "         Digest: ", container.image.digest)
     end
     println(io, "  Status: ", container.status)
     println(io, "  Created At: ", isnothing(container.created_at) ? "N/A" : string(container.created_at))
     println(io, "  Run Options:")
-    
+
     # Name
     if container.options.name !== nothing
         println(io, "    Name: ", container.options.name)
@@ -105,12 +256,12 @@ function Base.show(io::IO, container::Container)
         println(io, "    Name: (none)")
     end
 
-    # Ports
+    # Ports (resolved mappings, including ephemeral host port assignments)
     println(io, "    Ports:")
-    if isempty(container.options.ports)
+    if isempty(container.ports)
         println(io, "      (none)")
     else
-        for (cport, hport) in container.options.ports
+        for (cport, hport) in container.ports
             println(io, "      Container Port ", cport, " -> Host Port ", hport)
         end
     end
@@ -130,8 +281,8 @@ function Base.show(io::IO, container::Container)
     if isempty(container.options.environment)
         println(io, "      (none)")
     else
-        for (key, val) in container.options.environment
-            println(io, "      ", key, " = ", val)
+        for key in keys(container.options.environment)
+            println(io, "      ", key, " = <redacted>")
         end
     end
 
@@ -142,110 +293,339 @@ function Base.show(io::IO, container::Container)
 end
 
 """
-    wait_for(container::Container)
+    WaitTimeoutError(strategy, timeout, logs)
 
-Waits until the given strategy condition is met or the timeout expires.
-Throws an error if the wait condition isn't satisfied in time.
+Thrown when a container fails to satisfy its wait strategy within
+`wait_timeout` seconds. Carries the container's logs at the time the wait
+gave up to make failures diagnosable.
 """
-function wait_for(container::Container)
-    start_time = time()
-    strategy = container.options.wait_strategy
-    strategy === nothing && return
-    while true
-        elapsed = time() - start_time
-        if elapsed > container.options.wait_timeout
-            throw(ErrorException("Wait strategy timeout exceeded"))
+struct WaitTimeoutError <: Exception
+    strategy::WaitStrategy
+    timeout::Float64
+    logs::String
+end
+
+function Base.showerror(io::IO, e::WaitTimeoutError)
+    print(io, "WaitTimeoutError: container did not satisfy wait strategy ",
+          e.strategy, " within ", e.timeout, " seconds")
+    if !isempty(strip(e.logs))
+        print(io, "\ncontainer logs:\n", rstrip(e.logs))
+    end
+end
+
+# Parse "http://host[:port][/path]" into (host, port, path).
+function _parse_http_url(url::AbstractString)
+    m = match(r"^http://([^/:]+)(?::(\d+))?(/.*)?$", url)
+    m === nothing && throw(ArgumentError("WaitForHTTP only supports plain http://host[:port][/path] URLs, got: $url"))
+    host = String(m.captures[1])
+    port = m.captures[2] === nothing ? 80 : _port_number(parse(BigInt, m.captures[2]), "HTTP URL port")
+    path = m.captures[3] === nothing ? "/" : String(m.captures[3])
+    return host, port, path
+end
+
+# Connect a socket without allowing one probe to block the complete wait loop.
+function _connect_with_timeout(host::AbstractString, port::Int, timeout::Real)
+    sock = TCPSocket()
+    connected = @async try
+        connect(sock, host, port)
+        true
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || e isa Sockets.DNSError || rethrow()
+        return false
+    end
+    limit = max(Float64(timeout), 0.001)
+    status = timedwait(() -> istaskdone(connected), limit; pollint=min(0.01, limit))
+    if status !== :ok
+        close(sock)
+        return nothing
+    end
+    if fetch(connected) !== true
+        close(sock)
+        return nothing
+    end
+    return sock
+end
+
+# Read only the HTTP status line. The full response can be unbounded or use a
+# persistent connection, and readiness depends only on the status code.
+function _read_http_status_line(sock::TCPSocket, timeout::Real)
+    reader = @async try
+        bytes = UInt8[]
+        while length(bytes) < 8192
+            byte = read(sock, UInt8)
+            byte == UInt8('\n') && return String(bytes)
+            push!(bytes, byte)
         end
-        if strategy isa WaitForPort
-            host_port = container.options.ports[strategy.port]  # Assumes port mapping exists
-            try
-                sock = connect("127.0.0.1", host_port)
-                close(sock)
-                @info "Port $(strategy.port) is listening"
-                return true
-            catch
-                # Port is not yet open
-            end
-        elseif strategy isa WaitForLog
-            logs_output = docker_logs(container.id; follow=false, tail="all")
-            if occursin(strategy.pattern, logs_output)
-                @info "Found log pattern: $(strategy.pattern)"
-                return true
-            end
-        elseif strategy isa WaitForHTTP
-            try
-                sock = connect(strategy.url)
-                write(sock, "GET / HTTP/1.0\r\n\r\n")
-                response = String(read(sock, String))
-                if occursin(string(strategy.expected_status), response)
-                    @info "HTTP endpoint $(strategy.url) responded with $(strategy.expected_status)"
-                    return true
-                end
-            catch
-                # HTTP request failed
-            end
-        elseif strategy isa CustomWait
-            if strategy.check(container)
-                @info "Custom wait condition satisfied"
-                return true
-            end
+        return nothing
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || e isa EOFError || rethrow()
+        return nothing
+    end
+    limit = max(Float64(timeout), 0.001)
+    status = timedwait(() -> istaskdone(reader), limit; pollint=min(0.01, limit))
+    if status !== :ok
+        close(sock)
+        return nothing
+    end
+    return fetch(reader)
+end
+
+# One readiness probe per strategy; returns true when the condition holds.
+function check_wait_strategy(s::WaitForPort, container::Container; timeout::Real=1.0)
+    hp = get(container.ports, s.port, nothing)
+    hp === nothing && throw(ArgumentError("wait strategy (port=$(s.port),) has no matching entry in the container's port mappings"))
+    sock = _connect_with_timeout("127.0.0.1", hp, timeout)
+    sock === nothing && return false
+    try
+        # Docker's userland proxy (docker-proxy/vpnkit) accepts connections
+        # itself and only then dials the container, closing on failure — so a
+        # successful connect alone proves nothing about the service. Consider
+        # the port ready only if the connection is still open shortly after
+        # (or the service already sent data).
+        closed = @async try
+            eof(sock)
+        catch e
+            e isa InterruptException && rethrow()
+            true  # reset/aborted counts as closed
         end
-        sleep(container.options.wait_interval)
+        survival = min(0.25, max(Float64(timeout), 0.001))
+        if timedwait(() -> istaskdone(closed), survival; pollint=min(0.01, survival)) === :ok && fetch(closed) === true
+            return false  # proxy accepted, then closed: backend not listening
+        end
+        return true
+    finally
+        close(sock)
+    end
+end
+
+check_wait_strategy(s::WaitForLog, container::Container; timeout::Real=1.0) =
+    occursin(s.pattern, docker_logs(container.id; follow=false, tail="all"))
+
+function check_wait_strategy(s::WaitForHTTP, container::Container; timeout::Real=1.0)
+    host, port, path = _parse_http_url(s.url)
+    sock = _connect_with_timeout(host, port, timeout)
+    sock === nothing && return false
+    try
+        host_header = port == 80 ? host : string(host, ":", port)
+        write(sock, "GET $path HTTP/1.1\r\nHost: $host_header\r\nConnection: close\r\n\r\n")
+        status_line = _read_http_status_line(sock, timeout)
+        status_line === nothing && return false
+        # Do not accept an arbitrary TCP service whose first line happens to
+        # contain the expected number. Require an HTTP-version and a three-digit
+        # status code in the response status line.
+        response = match(r"^HTTP/\d+\.\d+ ([0-9]{3})(?: |$)",
+                         rstrip(status_line, '\r'))
+        return response !== nothing && tryparse(Int, response.captures[1]) == s.expected_status
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || e isa EOFError || rethrow()
+        return false  # connection refused / reset while the server starts up
+    finally
+        isopen(sock) && close(sock)
+    end
+end
+
+function check_wait_strategy(s::WaitForHealthy, container::Container; timeout::Real=1.0)
+    s.healthy || throw(ArgumentError("healthy wait strategy must specify (healthy=true,)"))
+    info = docker_inspect_container(container.id)
+    health = get(get(info, "State", Dict{String, Any}()), "Health", nothing)
+    health === nothing && throw(ArgumentError("wait strategy (healthy=true,) requires the image to define a HEALTHCHECK, but the container has none"))
+    return get(health, "Status", "") == "healthy"
+end
+
+check_wait_strategy(s::CustomWait, container::Container; timeout::Real=1.0) =
+    s.check(container) === true
+
+"""
+    ContainerExitedError(strategy, logs)
+
+Thrown when a container exits before satisfying its wait strategy — waiting
+longer cannot succeed, so the wait aborts immediately instead of running out
+the full `wait_timeout`. Carries the container's logs for diagnosis.
+"""
+struct ContainerExitedError <: Exception
+    strategy::WaitStrategy
+    logs::String
+end
+
+function Base.showerror(io::IO, e::ContainerExitedError)
+    print(io, "ContainerExitedError: container exited before satisfying wait strategy ",
+          e.strategy)
+    if !isempty(strip(e.logs))
+        print(io, "\ncontainer logs:\n", rstrip(e.logs))
+    end
+end
+
+# best-effort log fetch for wait failure errors
+function _logs_or_empty(container::Container)
+    return try
+        docker_logs(container.id; follow=false, tail="all")
+    catch e
+        e isa InterruptException && rethrow()
+        ""
     end
 end
 
 """
-run!(image::Image; name=nothing, ports=Dict{Int,Int}(), 
-              volumes=Dict{String,String}(), environment=Dict{String,String}(), 
-              command=nothing, detach::Bool=false) -> Container
+    wait_for(container::Container)
 
-Starts a container from the provided `Image` with the specified options.
-Returns a `Container` instance reflecting the running state.
+Waits until the container's wait strategy condition is met or `wait_timeout`
+expires. Throws a [`WaitTimeoutError`](@ref) (including the container's logs)
+if the condition isn't satisfied in time, or a [`ContainerExitedError`](@ref)
+as soon as the container exits without having satisfied the strategy.
+"""
+function wait_for(container::Container)
+    strategy = container.options.wait_strategy
+    strategy === nothing && return nothing
+    start_time = time_ns()
+    while true
+        elapsed = Float64(time_ns() - start_time) / 1.0e9
+        remaining = max(container.options.wait_timeout - elapsed, 0.0)
+        probe_timeout = min(container.options.wait_interval, max(remaining, 0.001))
+        check_wait_strategy(strategy, container; timeout=probe_timeout) && return nothing
+        if !is_running(container)
+            # the strategy can no longer become true (logs are final; ports/
+            # http/health are gone) — but re-check once to close the race
+            # where the condition was met just before the container exited
+            check_wait_strategy(strategy, container; timeout=probe_timeout) && return nothing
+            throw(ContainerExitedError(strategy, _logs_or_empty(container)))
+        end
+        elapsed = Float64(time_ns() - start_time) / 1.0e9
+        if elapsed >= container.options.wait_timeout
+            throw(WaitTimeoutError(strategy, container.options.wait_timeout, _logs_or_empty(container)))
+        end
+        sleep(min(container.options.wait_interval, container.options.wait_timeout - elapsed))
+    end
+end
+
+"""
+run!(image::Union{Image, AbstractString}; name=nothing, ports=Dict{Int,Int}(),
+     volumes=Dict{String,String}(), environment=Dict{String,String}(),
+     command=nothing, detach::Bool=true, wait_strategy=nothing,
+     wait_timeout=60.0, wait_interval=1.0) -> Container
+
+Starts a container from the provided `Image` — or an image reference string,
+which is resolved against local images first and pulled only when absent — and
+returns a `Container` handle.
+
+- `ports` maps container ports to host ports; a host port of `0` publishes the
+  container port on an OS-assigned ephemeral port (see [`host_port`](@ref)).
+  When `ports` is non-empty, no `wait_strategy` is given, and the run is
+  detached, `run!` waits for the lowest mapped container port to be ready.
+- `wait_strategy` may be `(port=...,)`, `(pattern=string_or_regex,)`,
+  `(url=..., expected_status=...)`, `(healthy=true,)`, or a function
+  `container -> Bool`. If the strategy is not satisfied within `wait_timeout`
+  seconds (or the container exits before satisfying it), the container is
+  removed and a [`WaitTimeoutError`](@ref) (or [`ContainerExitedError`](@ref))
+  is thrown.
+- With `detach=false` the call blocks until the container exits and returns the
+  handle even if the container's command exited with a non-zero status; use
+  [`logs`](@ref) and [`inspect`](@ref) (`State.ExitCode`) to diagnose.
+- `environment` values are passed through a mode-0600 temporary `--env-file`
+  that is deleted after the docker CLI reads it. Values are not placed on the
+  command line or in the docker CLI's own environment. Because Docker's env-file
+  format is line-based, names and values cannot contain NUL, CR, or LF.
+
+The started container is force-removed by a garbage-collection finalizer as a
+safety net; prefer [`with_container`](@ref) (or explicit [`remove!`](@ref)) for
+deterministic cleanup.
 """
 function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)::Container
-    if wait_strategy === nothing && !isempty(ports)
-        wait_strategy = (port=first(keys(ports)),)
+    ports = _normalize_ports(ports)
+    wait_strategy = normalize_wait_strategy(wait_strategy)
+    # Auto-wait on the lowest mapped container port — but only for detached
+    # runs: a foreground run has already exited, so its ports are gone.
+    if wait_strategy === nothing && !isempty(ports) && get(kw, :detach, true)
+        wait_strategy = WaitForPort((Int(minimum(keys(ports))),))
     end
     opts = RunOptions(; ports, wait_strategy, kw...)
-    # Call underlying runtime to create and start the container.
+    _validate_wait_timing(opts.wait_timeout, opts.wait_interval)
+    # Call underlying runtime to create and start the container. The label
+    # marks the container as Harbor-managed so `prune` can find leaked ones.
     cid = docker_run(image; name=opts.name, ports=opts.ports, volumes=opts.volumes,
-        environment=opts.environment, command=opts.command, detach=opts.detach)
-    cont = Container(cid, image, :running, now(), opts)
+        environment=opts.environment, command=opts.command, detach=opts.detach,
+        labels=Dict(HARBOR_LABEL => "true"))
+    # Resolve the actual host ports (ephemeral requests may differ from the
+    # requested mapping).
+    resolved_ports = isempty(opts.ports) ? Dict{Int, Int}() : try
+        docker_resolved_ports(cid)
+    catch e
+        e isa DockerError || rethrow()
+        @debug "Failed to resolve container ports" container_id=cid exception=(e, catch_backtrace())
+        Dict{Int, Int}(k => v for (k, v) in opts.ports if v != 0)
+    end
+    # A foreground (detach=false) run only returns once the container exits.
+    cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts, resolved_ports; managed=true)
     if opts.wait_strategy !== nothing
-        @info "Waiting for container to be ready using strategy $(opts.wait_strategy)"
-        wait_for(cont)
+        @debug "Waiting for container to be ready using strategy $(opts.wait_strategy)"
+        try
+            wait_for(cont)
+        catch
+            # the caller never receives the container handle, so remove the
+            # container rather than leaking it
+            cleanup!(cont)
+            rethrow()
+        end
     end
     return cont
 end
 
-run!(image; tag::String="latest", kw...) = run!(pull(image; tag=tag); kw...)
+run!(image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) =
+    run!(_resolve_image(image; tag); kw...)
+
+"""
+    host_port(container::Container, container_port::Integer) -> Int
+
+Returns the host port that `container_port` is published on. This is the
+canonical way to reach a container whose ports were requested with an
+ephemeral host port (`ports=Dict(container_port => 0)`). Throws an
+`ArgumentError` if the container port is not published.
+"""
+function host_port(container::Container, container_port::Integer)::Int
+    container_port = _port_number(container_port, "container port")
+    hp = get(container.ports, container_port, nothing)
+    hp === nothing && throw(ArgumentError("container port $container_port is not published to a host port (published: $(container.ports))"))
+    return hp
+end
 
 """
 inspect(container::Container) -> Dict
 
+Returns the container's full `docker inspect` output as a parsed JSON object.
 """
 function inspect(container::Container) :: Dict
-    @info "Inspecting container" container_id=container.id
+    @debug "Inspecting container" container_id=container.id
     return docker_inspect_container(container.id)
 end
 
 """
-logs(container::Container) -> String
+logs(container::Container; follow::Bool=false, tail="all") -> String
 
-Retrieves the logs for the specified container.
+Retrieves the logs (stdout and stderr merged) for the specified container.
+With `follow=true` the call blocks until the container stops, then returns the
+complete log output. `tail` limits the result to the last N lines.
 """
 function logs(container::Container; follow::Bool=false, tail::Union{String,Int}="all") :: String
-    @info "Fetching logs for container" container_id=container.id
+    @debug "Fetching logs for container" container_id=container.id
     return docker_logs(container.id; follow=follow, tail=tail)
 end
 
 """
 exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...) -> String
 
-Runs a command inside the specified container.
+Runs a command inside the specified container and returns its stdout. Throws a
+[`DockerError`](@ref) carrying the exit code and captured stderr if the command
+fails. Supported keywords mirror `docker exec` flags: `env`, `workdir`, `user`,
+`detach`, `interactive`, `tty`, `privileged`, `env_file`, `detach_keys`.
+`env` values are passed through a mode-0600 temporary `--env-file` that is
+deleted after the docker CLI reads it. They are not placed on the command line
+or in the docker CLI's own environment. Names and values cannot contain NUL,
+CR, or LF.
 """
 function exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...)::String
-    @info "Executing command in container" container_id=container.id
+    @debug "Executing command in container" container_id=container.id
     return docker_exec(container.id, exec_cmd; kw...)
 end
 
@@ -256,21 +636,123 @@ Gracefully stops a running container. Returns the `Container` with a new status.
 """
 function stop!(container::Container; timeout::Int=10)::Container
     # Stop the container via underlying system calls.
-    @info "Stopping container" container_id=container.id timeout=timeout
+    @debug "Stopping container" container_id=container.id timeout=timeout
     docker_stop(container.id; timeout=timeout)
     container.status = :stopped
     return container
 end
 
 """
-remove!(container::Container) -> Bool
+    start!(container::Container) -> Container
+
+Starts a stopped container. Returns the `Container` with an updated status
+and refreshed host port mappings (ephemeral ports may be re-assigned).
+"""
+function start!(container::Container)::Container
+    @debug "Starting container" container_id=container.id
+    docker_start(container.id)
+    container.status = :running
+    isempty(container.options.ports) || (container.ports = docker_resolved_ports(container.id))
+    return container
+end
+
+"""
+    restart!(container::Container; timeout::Int=10) -> Container
+
+Restarts a container (stopping it first if running, with `timeout` seconds of
+grace). Returns the `Container` with an updated status and refreshed host
+port mappings.
+"""
+function restart!(container::Container; timeout::Int=10)::Container
+    @debug "Restarting container" container_id=container.id timeout=timeout
+    docker_restart(container.id; timeout=timeout)
+    container.status = :running
+    isempty(container.options.ports) || (container.ports = docker_resolved_ports(container.id))
+    return container
+end
+
+"""
+    kill!(container::Container; signal="SIGKILL") -> Container
+
+Sends `signal` to the container's main process (default `SIGKILL`).
+Returns the `Container` with an updated status.
+"""
+function kill!(container::Container; signal::Union{String, Int}="SIGKILL")::Container
+    @debug "Killing container" container_id=container.id signal=signal
+    docker_kill(container.id; signal=signal)
+    # a non-fatal signal (e.g. SIGUSR1) leaves the container running
+    container.status = is_running(container) ? :running : :exited
+    return container
+end
+
+"""
+    is_running(container::Container) -> Bool
+
+Queries docker for the container's live state. Returns `false` if the
+container no longer exists.
+"""
+function is_running(container::Container)::Bool
+    info = try
+        docker_inspect_container(container.id)
+    catch e
+        e isa DockerError && _is_missing_container_error(e) && return false
+        rethrow()
+    end
+    return get(get(info, "State", Dict{String, Any}()), "Running", false) === true
+end
+
+"""
+remove!(container::Container; force::Bool=false) -> Bool
 
 Removes a container from the system. Returns `true` if successful.
 """
 function remove!(container::Container; force::Bool=false)::Bool
     # Remove container logic.
-    @info "Removing container" container_id=container.id force=force
-    return docker_rm(container.id; force=force)
+    @debug "Removing container" container_id=container.id force=force
+    docker_rm(container.id; force=force)
+    container.cleaned_up = true
+    container.status = :removed
+    return true
+end
+
+"""
+    cleanup!(container::Container; throw_errors::Bool=false)
+
+Synchronously force-remove the container (stopping it if necessary). Safe to
+call multiple times; does nothing if the container was already removed via
+`remove!` or a previous `cleanup!`. A failed removal leaves the handle eligible
+for another cleanup attempt. Errors are logged as warnings by default; set
+`throw_errors=true` to propagate them. Otherwise, a warning identifies the
+container that may still exist.
+"""
+function cleanup!(container::Container; throw_errors::Bool=false)
+    container.cleaned_up && return nothing
+    try
+        docker_rm(container.id; force=true)
+    catch e
+        e isa InterruptException && rethrow()
+        if e isa DockerError && _is_missing_container_error(e)
+            container.cleaned_up = true
+            container.status = :removed
+            return nothing
+        end
+        throw_errors && rethrow()
+        @warn "Container cleanup failed; container may still exist" container_id=container.id exception=(e, catch_backtrace())
+        return nothing
+    end
+    container.cleaned_up = true
+    container.status = :removed
+    return nothing
+end
+
+# Docker reports RFC3339Nano timestamps with trailing fractional zeros trimmed
+# (e.g. "2026-08-09T12:34:56.78Z"); reduce to millisecond precision.
+function _parse_docker_timestamp(s::AbstractString)
+    m = match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?", s)
+    m === nothing && return nothing
+    frac = m.captures[2]
+    ms = frac === nothing ? "" : "." * first(rpad(frac, 3, '0'), 3)
+    return tryparse(DateTime, m.captures[1] * ms)
 end
 
 """
@@ -280,44 +762,78 @@ Lists containers. If `all` is true, lists all containers; otherwise, only runnin
 """
 function ps(; all::Bool=true)::Vector{Container}
     # Query the underlying system for container info.
-    @info "Listing containers" all=all
+    @debug "Listing containers" all=all
     ids = docker_ps(; all=all)
     containers = Container[]
     for id in ids
-        info = docker_inspect_container(id)
-        # get image from inspect result
-        img = get(get(info, "Config", Dict()), "Image", "unknown")
-        tag = get(get(info, "Config", Dict()), "Tag", "unknown")
-        image = Image(img, tag)
-        status = Symbol(get(get(info, "State", Dict()), "Status", "unknown"))
-        created_at = get(info, "Created", nothing)
-        if created_at !== nothing
-            created_at = DateTime(created_at[1:min(sizeof(created_at), 23)])
+        # a container can vanish between the ps listing and the inspect call
+        info = try
+            docker_inspect_container(id)
+        catch e
+            e isa DockerError && _is_missing_container_error(e) && continue
+            rethrow()
         end
-        # run options
+        config = get(info, "Config", Dict{String, Any}())
+        hostconfig = get(info, "HostConfig", Dict{String, Any}())
+        img_raw = get(config, "Image", "unknown")
+        if startswith(img_raw, "sha256:")
+            # a raw image id, not a name[:tag][@digest] reference
+            image = Image(String(img_raw), "", nothing)
+        else
+            img_name, img_tag, img_digest = _split_ref(img_raw)
+            image = Image(img_name, something(img_tag, "latest"), img_digest)
+        end
+        status = Symbol(get(get(info, "State", Dict{String, Any}()), "Status", "unknown"))
+        created_raw = get(info, "Created", nothing)
+        created_at = created_raw isa AbstractString ? _parse_docker_timestamp(created_raw) : nothing
+        # inspect reports names with a leading '/'
         name = get(info, "Name", nothing)
+        name isa AbstractString && (name = String(lstrip(name, '/')))
         ports = Dict{Int, Int}()
-        for (k, v) in get(get(info, "HostConfig", Dict()), "PortBindings", Dict())
-            # key is like: "80/tcp"
-            ports[parse(Int, split(k, "/")[1])] = parse(Int, v[1]["HostPort"])
+        for (k, v) in something(get(hostconfig, "PortBindings", nothing), Dict{String, Any}())
+            # key is like: "80/tcp"; value is null for unbound exposed ports
+            (v === nothing || isempty(v)) && continue
+            container_port = tryparse(Int, first(split(k, "/")))
+            host_port = tryparse(Int, string(get(v[1], "HostPort", "")))
+            (container_port === nothing || host_port === nothing) && continue
+            ports[container_port] = host_port
         end
-        volumes = Dict{String, String}()
-        for (k, v) in something(get(get(info, "HostConfig", Dict()), "Binds", Dict()), Dict())
-            # key is like: "/host/path:/container/path"
-            volumes[split(k, ":")[2]] = split(v, ":")[1]
-        end
-        env_vars = get(get(info, "Config", Dict()), "Env", String[])
+        volumes = _parse_mount_volumes(info)
         environment = Dict{String, String}()
-        for env in env_vars
-            key, val = split(env, "="; limit=2)
-            environment[key] = val
+        for env in something(get(config, "Env", nothing), [])
+            kv = split(env, "="; limit=2)
+            length(kv) == 2 && (environment[String(kv[1])] = String(kv[2]))
         end
-        command = String[x for x in get(get(info, "Config", Dict()), "Cmd", String[])]
-        detach = get(get(info, "HostConfig", Dict()), "NetworkMode", "default") == "bridge"
-        cont = Container(id, image, status, created_at, RunOptions(; name, ports, volumes, environment, command, detach))
+        command = String[string(x) for x in something(get(config, "Cmd", nothing), [])]
+        cont = Container(id, image, status, created_at,
+            RunOptions(; name, ports, volumes, environment, command),
+            _parse_network_ports(info))
         push!(containers, cont)
     end
     return containers
+end
+
+"""
+    prune() -> Int
+
+Force-removes **all** containers on the host that were started by Harbor
+(identified by the `$HARBOR_LABEL` label), including ones leaked by
+crashed or killed Julia processes. Returns the number of containers removed.
+Containers not started by Harbor are never touched.
+"""
+function prune()::Int
+    ids = docker_ps(; all=true, label=HARBOR_LABEL * "=true")
+    removed = 0
+    for id in ids
+        try
+            docker_rm(id; force=true)
+            removed += 1
+        catch e
+            e isa InterruptException && rethrow()
+            @warn "Failed to prune Harbor container; container may still exist" container_id=id exception=(e, catch_backtrace())
+        end
+    end
+    return removed
 end
 
 """
@@ -325,24 +841,45 @@ with_container(image::Image; kw...) do container
     # operations on container
 end
 
-Runs a container with the specified image and keyword options. The container is automatically
-stopped and removed after the block completes (even if an error occurs).
+Runs a container with the specified image and keyword options. The container is
+force-removed synchronously after the block completes (even if an error occurs),
+so by the time `with_container` returns, the container is gone and its name and
+ports are free for reuse. If a graceful shutdown is required, call `stop!` on
+the container at the end of the block.
+
+If `container_logs_on_error=true`, the container's logs are logged with `@error`
+before the block's exception is rethrown.
+
+If cleanup fails after a successful block, the cleanup error is thrown. If the
+block already raised an exception, Harbor preserves that original exception and
+logs a cleanup warning instead. The handle remains eligible for a later
+[`cleanup!`](@ref) attempt.
 """
 function with_container(f::Function, image::Image; container_logs_on_error::Bool=false, kw...)
     container = run!(image; kw...)
+    block_succeeded = false
     try
-        return f(container)
+        result = f(container)
+        block_succeeded = true
+        return result
     catch
         if container_logs_on_error
-            logs_output = docker_logs(container.id; follow=false, tail="all")
-            @error logs_output
+            logs_output = try
+                docker_logs(container.id; follow=false, tail="all")
+            catch e
+                "failed to fetch container logs: " * sprint(showerror, e)
+            end
+            @error "with_container block failed; container logs:\n" * logs_output
         end
         rethrow()
     finally
-        finalize(container)
+        # A cleanup failure after a successful block must be visible to the
+        # caller. On the error path, preserve the block's original exception.
+        cleanup!(container; throw_errors=block_succeeded)
     end
 end
 
-with_container(f::Function, image::String; tag="latest", kw...) = with_container(f, pull(image; tag=tag); kw...)
+with_container(f::Function, image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) =
+    with_container(f, _resolve_image(image; tag); kw...)
 
 end
