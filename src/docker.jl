@@ -97,8 +97,14 @@ Runs `docker rmi [--force] <image>`. Returns `true` on success.
 function docker_rm_image(image::Image; force::Bool=false)::Bool
     args = ["rmi"]
     force && push!(args, "--force")
-    # remove by name:tag (removing by digest would leave the tag behind)
-    push!(args, string(image.name, ":", image.tag))
+    # Tagged images are removed by name:tag; digest-pinned pulls have no tag,
+    # so remove the digest reference (which docker treats as removing the
+    # image together with any tags that point at it).
+    if isempty(image.tag) && image.digest !== nothing
+        push!(args, string(image.name, "@", image.digest))
+    else
+        push!(args, string(image.name, ":", image.tag))
+    end
     docker_read(args)
     return true
 end

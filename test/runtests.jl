@@ -6,6 +6,15 @@ for leftover in ["harbor-ps-safety-test", "harbor-wait-timeout-test", "harbor-na
     run(pipeline(ignorestatus(`docker rm -f $leftover`); stdout=devnull, stderr=devnull))
 end
 
+# An OS-assigned free host port (closed again immediately — a small race, but
+# far less collision-prone than hardcoded ports on shared CI runners).
+function free_port()
+    server = listen(ip"127.0.0.1", 0)
+    port = Int(getsockname(server)[2])
+    close(server)
+    return port
+end
+
 # Shared test images, pulled once (repeated pulls hammer Docker Hub's
 # anonymous rate limits on CI).
 const ALPINE = Harbor.pull("alpine"; tag="latest")
@@ -35,8 +44,19 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test Harbor.normalize_wait_strategy((healthy=true,)) isa Harbor.WaitForHealthy
         @test Harbor.normalize_wait_strategy(c -> true) isa Harbor.CustomWait
         @test_throws ArgumentError Harbor.normalize_wait_strategy((bogus=1,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((pattern=5,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((port="80",))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((healthy=1,))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((port=1, pattern="x"))
         @test_throws ArgumentError Harbor.normalize_wait_strategy(42)
+    end
+
+    @testset "docker timestamp parsing" begin
+        @test Harbor._parse_docker_timestamp("2026-08-09T12:34:56.789123456Z") == DateTime(2026, 8, 9, 12, 34, 56, 789)
+        # docker trims trailing fractional zeros
+        @test Harbor._parse_docker_timestamp("2026-08-09T12:34:56.78Z") == DateTime(2026, 8, 9, 12, 34, 56, 780)
+        @test Harbor._parse_docker_timestamp("2026-08-09T12:34:56Z") == DateTime(2026, 8, 9, 12, 34, 56)
+        @test Harbor._parse_docker_timestamp("garbage") === nothing
     end
 
     @testset "http url parsing" begin
@@ -112,6 +132,10 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test Harbor.is_running(cont)
         Harbor.restart!(cont; timeout=1)
         @test Harbor.is_running(cont)
+        # a non-fatal signal must not mark the container exited
+        Harbor.kill!(cont; signal="SIGUSR1")
+        @test cont.status == :running
+        @test Harbor.is_running(cont)
         Harbor.kill!(cont)
         @test !Harbor.is_running(cont)
         @test cont.status == :exited
@@ -136,10 +160,11 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
     @testset "ps observes but never manages containers" begin
         img = ALPINE
         tmp = mktempdir()
+        hp = free_port()
         cont = Harbor.run!(img; name="harbor-ps-safety-test", command=["sleep", "60"],
                            volumes=Dict("/harbor-data" => tmp),
                            environment=Dict("HARBOR_PS_TEST" => "1"),
-                           ports=Dict(9955 => 19955))
+                           ports=Dict(9955 => hp), wait_strategy=c -> true)
         try
             listed = Harbor.ps(; all=true)
             @test isa(listed, Vector{Harbor.Container})
@@ -153,8 +178,8 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
             # volume binds parse (this used to crash ps entirely)
             @test haskey(observed.options.volumes, "/harbor-data")
             @test get(observed.options.environment, "HARBOR_PS_TEST", "") == "1"
-            @test get(observed.options.ports, 9955, 0) == 19955
-            @test get(observed.ports, 9955, 0) == 19955
+            @test get(observed.options.ports, 9955, 0) == hp
+            @test get(observed.ports, 9955, 0) == hp
             # finalizing observed handles must NOT touch the real containers
             foreach(finalize, listed)
             GC.gc(); sleep(1)
@@ -183,12 +208,14 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
 
     @testset "wait strategies" begin
         img = BUSYBOX
-        # HTTP wait strategy end-to-end (fixed host port so the URL is known upfront)
+        # HTTP wait strategy end-to-end (the URL must be known up front, so pick a
+        # free host port dynamically instead of hardcoding one)
+        hp = free_port()
         Harbor.with_container(img; command=["httpd", "-f", "-p", "8080"],
-                              ports=Dict(8080 => 18080),
-                              wait_strategy=(url="http://127.0.0.1:18080/no-such-file", expected_status=404),
+                              ports=Dict(8080 => hp),
+                              wait_strategy=(url="http://127.0.0.1:$hp/no-such-file", expected_status=404),
                               wait_timeout=30.0) do cont
-            @test Harbor.host_port(cont, 8080) == 18080
+            @test Harbor.host_port(cont, 8080) == hp
         end
 
         # log wait matches both stdout and stderr, and accepts Regex
@@ -219,6 +246,34 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         end
         @test err isa ArgumentError
         @test occursin("HEALTHCHECK", sprint(showerror, err))
+    end
+
+    @testset "port wait is not fooled by docker's userland proxy" begin
+        # nothing listens on 8080 inside the container; docker's proxy still
+        # accepts TCP connections on the published host port
+        err = try
+            Harbor.run!(ALPINE; command=["sleep", "30"], ports=Dict(8080 => 0),
+                        wait_timeout=3.0, wait_interval=0.5)
+            nothing
+        catch e
+            e
+        end
+        @test err isa Harbor.WaitTimeoutError
+    end
+
+    @testset "foreground non-zero exit returns the handle, no leak" begin
+        before = length(Harbor.docker_ps(all=true, label=Harbor.HARBOR_LABEL * "=true"))
+        cont = Harbor.run!(ALPINE; command=["sh", "-c", "echo failing-output; exit 7"], detach=false)
+        @test cont.status == :exited
+        @test occursin("failing-output", Harbor.logs(cont))
+        info = Harbor.inspect(cont)
+        @test get(get(info, "State", Dict{String, Any}()), "ExitCode", -1) == 7
+        Harbor.remove!(cont; force=true)
+        # foreground + ports: the auto port-wait must not fire for exited runs
+        cont2 = Harbor.run!(ALPINE; command=["true"], detach=false, ports=Dict(8080 => 0))
+        @test cont2.status == :exited
+        Harbor.remove!(cont2; force=true)
+        @test length(Harbor.docker_ps(all=true, label=Harbor.HARBOR_LABEL * "=true")) == before
     end
 
     @testset "wait timeout removes the container and reports logs" begin
@@ -310,10 +365,20 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         Harbor.cleanup!(c2)
     end
 
-    # Last: removing the image (containers referencing it are gone by now).
+    # Last: removing images (containers referencing them are gone by now).
     @testset "remove image" begin
         @test Harbor.remove(BUSYBOX; force=true)
         @test !any(i -> i.name == "busybox" && i.tag == "latest", Harbor.images())
+    end
+
+    @testset "digest-pinned pull" begin
+        @test ALPINE.digest !== nothing
+        pinned = Harbor.pull("alpine@" * ALPINE.digest)
+        @test pinned.digest == ALPINE.digest
+        @test pinned.tag == ""  # digest pulls create no local tag
+        # docker removes a digest-referenced image together with all its tags
+        @test Harbor.remove(pinned)
+        @test !any(i -> i.name == "alpine" && i.tag == "latest", Harbor.images())
     end
 
 end

@@ -26,11 +26,14 @@ Harbor.pull("alpine")
 # list images
 Harbor.images()
 
-# run a container
-container = Harbor.run!("alpine"; command=["echo", "hello world"])
+# run a (long-lived) container
+container = Harbor.run!("alpine"; command=["sleep", "600"])
 
 # exec in a container (throws a DockerError with exit code + stderr on failure)
 output = Harbor.exec(container, ["sh", "-c", "echo -n hi"])
+
+# fetch its logs
+Harbor.logs(container)
 
 # list containers (observed containers are never auto-removed by Harbor)
 Harbor.ps()
@@ -42,7 +45,7 @@ Harbor.restart!(container)
 Harbor.kill!(container)
 
 # remove a container
-Harbor.remove!(container)
+Harbor.remove!(container; force=true)
 
 # lifecycle-managed container block: the container is force-removed
 # synchronously when the block exits (even on error)

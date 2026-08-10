@@ -43,14 +43,40 @@ the `tag` keyword, `"latest"` is used. The returned `Image` records the
 image's registry digest when it can be determined.
 """
 function pull(image::String; tag::Union{Nothing, String}=nothing)::Image
+    name, tag, digest = _check_ref(image, tag)
+    @debug "Pulling image" name tag digest
+    return docker_pull(name; tag, digest)
+end
+
+# Shared reference validation for pull/_resolve_image: returns (name, tag, digest)
+# with the effective tag resolved. Digest-pinned pulls create no local tag, so
+# their Image records an empty tag.
+function _check_ref(image::AbstractString, tag::Union{Nothing, String})
     isempty(image) && throw(ArgumentError("Image name cannot be empty"))
     name, ref_tag, digest = _split_ref(image)
     if ref_tag !== nothing && tag !== nothing && ref_tag != tag
         throw(ArgumentError("conflicting tags: image reference \"$image\" specifies tag \"$ref_tag\" but tag=\"$tag\" was also given"))
     end
-    tag = something(ref_tag, tag, "latest")
-    @debug "Pulling image" name tag digest
-    return docker_pull(name; tag, digest)
+    tag = digest === nothing ? something(ref_tag, tag, "latest") : ""
+    return String(name), tag, digest
+end
+
+# Resolve an image reference for run!/with_container: use the local image when
+# present, pulling only when it isn't. Keeps string-form calls usable offline
+# and avoids a registry round-trip (and Docker Hub rate-limit exposure) on
+# every call.
+function _resolve_image(image::AbstractString; tag::Union{Nothing, String}=nothing)::Image
+    name, etag, digest = _check_ref(image, tag)
+    ref = digest === nothing ? string(name, ":", etag) : string(name, "@", digest)
+    present = try
+        docker_read(["image", "inspect", "--format", "{{.Id}}", ref])
+        true
+    catch e
+        e isa DockerError || rethrow()
+        false
+    end
+    present && return Image(name, etag, digest)
+    return pull(String(image); tag)
 end
 
 """
@@ -85,15 +111,16 @@ const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, WaitForHealthy,
 normalize_wait_strategy(::Nothing) = nothing
 normalize_wait_strategy(f::Function) = CustomWait((f,))
 function normalize_wait_strategy(s::NamedTuple)
-    if length(s) == 1 && haskey(s, :port)
+    if length(s) == 1 && haskey(s, :port) && s.port isa Integer
         return WaitForPort((Int(s.port),))
-    elseif length(s) == 1 && haskey(s, :pattern)
-        return WaitForLog((s.pattern,))
-    elseif length(s) == 2 && haskey(s, :url) && haskey(s, :expected_status)
+    elseif length(s) == 1 && haskey(s, :pattern) && s.pattern isa Union{AbstractString, Regex}
+        return WaitForLog((s.pattern isa Regex ? s.pattern : String(s.pattern),))
+    elseif length(s) == 2 && haskey(s, :url) && haskey(s, :expected_status) &&
+           s.url isa AbstractString && s.expected_status isa Integer
         return WaitForHTTP((String(s.url), Int(s.expected_status)))
-    elseif length(s) == 1 && haskey(s, :healthy)
-        return WaitForHealthy((Bool(s.healthy),))
-    elseif length(s) == 1 && haskey(s, :check)
+    elseif length(s) == 1 && haskey(s, :healthy) && s.healthy isa Bool
+        return WaitForHealthy((s.healthy,))
+    elseif length(s) == 1 && haskey(s, :check) && s.check isa Function
         return CustomWait((s.check,))
     end
     throw(ArgumentError("unrecognized wait_strategy $s; expected (port=...,), (pattern=...,), " *
@@ -365,7 +392,7 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
         docker_resolved_ports(cid)
     catch e
         @debug "Failed to resolve container ports" container_id=cid exception=(e, catch_backtrace())
-        copy(opts.ports)
+        Dict{Int, Int}(k => v for (k, v) in opts.ports if v != 0)
     end
     # A foreground (detach=false) run only returns once the container exits.
     cont = Container(cid, image, opts.detach ? :running : :exited, now(), opts, resolved_ports; managed=true)
@@ -383,7 +410,8 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
     return cont
 end
 
-run!(image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) = run!(pull(String(image); tag); kw...)
+run!(image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) =
+    run!(_resolve_image(image; tag); kw...)
 
 """
     host_port(container::Container, container_port::Integer) -> Int
@@ -428,6 +456,9 @@ Runs a command inside the specified container and returns its stdout. Throws a
 [`DockerError`](@ref) carrying the exit code and captured stderr if the command
 fails. Supported keywords mirror `docker exec` flags: `env`, `workdir`, `user`,
 `detach`, `interactive`, `tty`, `privileged`, `env_file`, `detach_keys`.
+`env` values are forwarded through the docker CLI's process environment (not
+its command line), so names the docker CLI itself reads (`DOCKER_HOST`, ...)
+also affect that one CLI invocation.
 """
 function exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...)::String
     @debug "Executing command in container" container_id=container.id
@@ -485,7 +516,8 @@ Returns the `Container` with an updated status.
 function kill!(container::Container; signal::Union{String, Int}="SIGKILL")::Container
     @debug "Killing container" container_id=container.id signal=signal
     docker_kill(container.id; signal=signal)
-    container.status = :exited
+    # a non-fatal signal (e.g. SIGUSR1) leaves the container running
+    container.status = is_running(container) ? :running : :exited
     return container
 end
 
@@ -539,6 +571,16 @@ function cleanup!(container::Container)
     return nothing
 end
 
+# Docker reports RFC3339Nano timestamps with trailing fractional zeros trimmed
+# (e.g. "2026-08-09T12:34:56.78Z"); reduce to millisecond precision.
+function _parse_docker_timestamp(s::AbstractString)
+    m = match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?", s)
+    m === nothing && return nothing
+    frac = m.captures[2]
+    ms = frac === nothing ? "" : "." * first(rpad(frac, 3, '0'), 3)
+    return tryparse(DateTime, m.captures[1] * ms)
+end
+
 """
 ps(; all::Bool=true) -> Vector{Container}
 
@@ -563,9 +605,7 @@ function ps(; all::Bool=true)::Vector{Container}
         image = Image(img_name, something(img_tag, "latest"), img_digest)
         status = Symbol(get(get(info, "State", Dict{String, Any}()), "Status", "unknown"))
         created_raw = get(info, "Created", nothing)
-        # e.g. "2026-08-09T12:34:56.789123456Z": keep millisecond precision
-        created_at = created_raw isa AbstractString ?
-            tryparse(DateTime, created_raw[1:min(sizeof(created_raw), 23)]) : nothing
+        created_at = created_raw isa AbstractString ? _parse_docker_timestamp(created_raw) : nothing
         # inspect reports names with a leading '/'
         name = get(info, "Name", nothing)
         name isa AbstractString && (name = String(lstrip(name, '/')))
@@ -655,6 +695,6 @@ function with_container(f::Function, image::Image; container_logs_on_error::Bool
 end
 
 with_container(f::Function, image::AbstractString; tag::Union{Nothing, String}=nothing, kw...) =
-    with_container(f, pull(String(image); tag); kw...)
+    with_container(f, _resolve_image(image; tag); kw...)
 
 end
