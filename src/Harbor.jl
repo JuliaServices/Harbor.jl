@@ -53,7 +53,18 @@ end
 # their Image records an empty tag.
 function _check_ref(image::AbstractString, tag::Union{Nothing, String})
     isempty(image) && throw(ArgumentError("Image name cannot be empty"))
+    tag !== nothing && isempty(tag) && throw(ArgumentError("Image tag cannot be empty"))
     name, ref_tag, digest = _split_ref(image)
+    isempty(name) && throw(ArgumentError("Image name cannot be empty"))
+    occursin('@', name) && throw(ArgumentError("Image reference can contain at most one '@' separator: $image"))
+    ref_tag !== nothing && isempty(ref_tag) && throw(ArgumentError("Image tag cannot be empty"))
+    if digest !== nothing
+        isempty(digest) && throw(ArgumentError("Image digest cannot be empty"))
+        digest_parts = split(digest, ':'; limit=2)
+        (length(digest_parts) == 2 && all(part -> !isempty(part), digest_parts)) ||
+            throw(ArgumentError("Image digest must have algorithm:value form, got $(repr(digest))"))
+        tag !== nothing && throw(ArgumentError("tag keyword cannot be combined with a digest-pinned image reference"))
+    end
     if ref_tag !== nothing && tag !== nothing && ref_tag != tag
         throw(ArgumentError("conflicting tags: image reference \"$image\" specifies tag \"$ref_tag\" but tag=\"$tag\" was also given"))
     end
@@ -237,7 +248,7 @@ function Base.show(io::IO, container::Container)
     println(io, "  Status: ", container.status)
     println(io, "  Created At: ", isnothing(container.created_at) ? "N/A" : string(container.created_at))
     println(io, "  Run Options:")
-    
+
     # Name
     if container.options.name !== nothing
         println(io, "    Name: ", container.options.name)
@@ -778,13 +789,7 @@ function ps(; all::Bool=true)::Vector{Container}
             (container_port === nothing || host_port === nothing) && continue
             ports[container_port] = host_port
         end
-        volumes = Dict{String, String}()
-        # Binds is an array of "/host/path:/container/path[:opts]" strings
-        for bind in something(get(hostconfig, "Binds", nothing), [])
-            parts = split(bind, ":")
-            length(parts) >= 2 || continue
-            volumes[String(parts[2])] = String(parts[1])
-        end
+        volumes = _parse_mount_volumes(info)
         environment = Dict{String, String}()
         for env in something(get(config, "Env", nothing), [])
             kv = split(env, "="; limit=2)

@@ -38,6 +38,11 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test Harbor._split_ref("localhost:5000/img:tag") == ("localhost:5000/img", "tag", nothing)
         @test Harbor._split_ref("alpine@sha256:abc") == ("alpine", nothing, "sha256:abc")
         @test Harbor._split_ref("repo/img:1.0@sha256:abc") == ("repo/img", "1.0", "sha256:abc")
+        @test_throws ArgumentError Harbor._check_ref("@sha256:abc", nothing)
+        @test_throws ArgumentError Harbor._check_ref("alpine@", nothing)
+        @test_throws ArgumentError Harbor._check_ref("alpine:", nothing)
+        @test_throws ArgumentError Harbor._check_ref("a@@sha256:abc", nothing)
+        @test_throws ArgumentError Harbor._check_ref("alpine@sha256:abc", "latest")
     end
 
     @testset "wait strategy normalization" begin
@@ -70,6 +75,20 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test Harbor._parse_docker_timestamp("2026-08-09T12:34:56.78Z") == DateTime(2026, 8, 9, 12, 34, 56, 780)
         @test Harbor._parse_docker_timestamp("2026-08-09T12:34:56Z") == DateTime(2026, 8, 9, 12, 34, 56)
         @test Harbor._parse_docker_timestamp("garbage") === nothing
+    end
+
+    @testset "structured mount parsing" begin
+        info = Dict("Mounts" => [
+            Dict("Type" => "bind", "Source" => raw"C:\host\data",
+                 "Destination" => raw"C:\container\data"),
+            Dict("Type" => "volume", "Name" => "named-volume",
+                 "Source" => "/var/lib/docker/volumes/named-volume/_data",
+                 "Destination" => "/data"),
+        ])
+        @test Harbor._parse_mount_volumes(info) == Dict(
+            raw"C:\container\data" => raw"C:\host\data",
+            "/data" => "named-volume",
+        )
     end
 
     @testset "http url parsing" begin

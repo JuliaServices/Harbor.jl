@@ -87,16 +87,28 @@ function docker_pull(image_name::String; tag::String="latest",
                      digest::Union{Nothing, String}=nothing)::Image
     ref = digest === nothing ? string(image_name, ":", tag) : string(image_name, "@", digest)
     docker_read(["pull", ref])
-    if digest === nothing
-        digest = try
-            repo_digest = chomp(docker_read(["image", "inspect", "--format", "{{index .RepoDigests 0}}", ref]))
-            String(last(split(repo_digest, "@")))
-        catch
-            # e.g. locally-built images have no RepoDigests
-            nothing
-        end
-    end
+    digest === nothing && (digest = _registry_digest(image_name, ref))
     return Image(image_name, tag, digest)
+end
+
+function _registry_digest(image_name::String, ref::String)
+    output = try
+        docker_read(["image", "inspect", "--format", "{{json .RepoDigests}}", ref])
+    catch e
+        e isa DockerError || rethrow()
+        return nothing
+    end
+    repo_digests = JSON.parse(output)
+    repo_digests isa AbstractVector || return nothing
+    isempty(repo_digests) && return nothing
+    prefix = image_name * "@"
+    index = findfirst(repo_digest -> repo_digest isa AbstractString &&
+                                     startswith(repo_digest, prefix), repo_digests)
+    repo_digest = String(index === nothing ? first(repo_digests) : repo_digests[index])
+    separator = findlast('@', repo_digest)
+    separator === nothing && return nothing
+    digest = String(repo_digest[separator+1:end])
+    return isempty(digest) ? nothing : digest
 end
 
 """
@@ -255,6 +267,23 @@ function _parse_network_ports(info)::Dict{Int, Int}
         ports[container_port] = host_port
     end
     return ports
+end
+
+# Extract volume and bind mappings from docker inspect's structured Mounts
+# array. This avoids parsing colon-delimited HostConfig.Binds strings, which is
+# ambiguous for Windows drive-letter paths.
+function _parse_mount_volumes(info)::Dict{String, String}
+    volumes = Dict{String, String}()
+    for mount in something(get(info, "Mounts", nothing), [])
+        mount isa AbstractDict || continue
+        destination = get(mount, "Destination", nothing)
+        source = get(mount, "Type", "") == "volume" ?
+            get(mount, "Name", get(mount, "Source", nothing)) :
+            get(mount, "Source", nothing)
+        (destination isa AbstractString && source isa AbstractString && !isempty(source)) || continue
+        volumes[String(destination)] = String(source)
+    end
+    return volumes
 end
 
 """
