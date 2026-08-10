@@ -353,23 +353,33 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test result == "done"
     end
 
-    @testset "environment values reach the container" begin
+    @testset "environment values reach the container without changing the docker CLI" begin
         Harbor.with_container(ALPINE; command=["sleep", "30"],
-                              environment=Dict("SECRET_VALUE" => "hunter2")) do cont
+                              environment=Dict("SECRET_VALUE" => "hunter2",
+                                               "DOCKER_HOST" => "container-only")) do cont
             @test chomp(Harbor.exec(cont, ["sh", "-c", "echo -n \$SECRET_VALUE"])) == "hunter2"
+            @test chomp(Harbor.exec(cont, ["sh", "-c", "echo -n \$DOCKER_HOST"])) == "container-only"
+            @test chomp(Harbor.exec(cont, ["sh", "-c", "echo -n \$DOCKER_HOST"];
+                                    env=Dict("DOCKER_HOST" => "exec-only"))) == "exec-only"
         end
+        @test_throws ArgumentError Harbor.run!(ALPINE; command=["true"],
+                                               environment=Dict("MULTILINE" => "a\nb"))
     end
 
     @testset "show" begin
         img = Harbor.Image("alpine", "latest", nothing)
         opts = Harbor.RunOptions(; name="shown", ports=Dict(80 => 8080),
-                                 volumes=Dict("/c" => "/h"), environment=Dict("A" => "b"),
+                                 volumes=Dict("/c" => "/h"),
+                                 environment=Dict("PASSWORD" => "unique-secret-value"),
                                  command=["echo", "hi"])
         cont = Harbor.Container("abc123", img, :running, now(), opts, Dict(80 => 8080))
         str = sprint(show, cont)
         @test occursin("abc123", str)
         @test occursin("shown", str)
         @test occursin("8080", str)
+        @test occursin("PASSWORD", str)
+        @test occursin("<redacted>", str)
+        @test !occursin("unique-secret-value", str)
         # unmanaged handles have no finalizer side effects
         finalize(cont)
     end

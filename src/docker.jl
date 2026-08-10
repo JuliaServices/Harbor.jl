@@ -17,16 +17,40 @@ function Base.showerror(io::IO, e::DockerError)
     end
 end
 
+# Pass container environment values through a private temporary file. Passing
+# `-e KEY=VALUE` exposes values in the host process list, while passing `-e KEY`
+# and adding the values to the docker CLI process environment lets names such
+# as DOCKER_HOST and DOCKER_CONFIG change the CLI invocation itself.
+function _with_env_file(f::F, environment) where {F}
+    (environment === nothing || isempty(environment)) && return f(nothing)
+    path, io = mktemp()
+    try
+        chmod(path, 0o600)
+        for (raw_key, raw_value) in environment
+            key = String(raw_key)
+            value = String(raw_value)
+            if isempty(key) || startswith(key, '#') ||
+               any(c -> c == '=' || c == '\n' || c == '\r' || c == '\0', key)
+                throw(ArgumentError("environment variable names must be non-empty and cannot start with '#' or contain '=', NUL, CR, or LF"))
+            end
+            if any(c -> c == '\n' || c == '\r' || c == '\0', value)
+                throw(ArgumentError("environment variable $key cannot contain NUL, CR, or LF when passed through docker --env-file"))
+            end
+            println(io, key, "=", value)
+        end
+        close(io)
+        return f(path)
+    finally
+        isopen(io) && close(io)
+        rm(path; force=true)
+    end
+end
+
 # Run a docker CLI command, returning captured stdout as a String.
 # stderr is captured and included in the DockerError thrown on failure.
 # With `stderr_to_stdout=true`, stderr is merged into the returned output instead.
-function docker_read(args::Vector{String}; env=nothing, stderr_to_stdout::Bool=false)::String
-    # `base` (argv only) is what any thrown DockerError carries: `addenv`
-    # materializes the entire process environment into cmd.env, and showing
-    # that in an exception would leak every env var value — including the
-    # secrets the -e KEY forwarding scheme exists to keep out of logs.
-    base = Cmd(vcat(["docker"], args))
-    cmd = env === nothing ? base : addenv(base, env)
+function docker_read(args::Vector{String}; stderr_to_stdout::Bool=false)::String
+    cmd = Cmd(vcat(["docker"], args))
     out = IOBuffer()
     err = stderr_to_stdout ? out : IOBuffer()
     proc = try
@@ -39,7 +63,7 @@ function docker_read(args::Vector{String}; env=nothing, stderr_to_stdout::Bool=f
     end
     output = String(take!(out))
     if !success(proc)
-        throw(DockerError(base, proc.exitcode, stderr_to_stdout ? output : String(take!(err))))
+        throw(DockerError(cmd, proc.exitcode, stderr_to_stdout ? output : String(take!(err))))
     end
     return output
 end
@@ -126,71 +150,64 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
     # The container id is communicated via --cidfile: `docker run` only prints
     # the id on stdout when detached; in the foreground case stdout is the
     # container's own output.
-    cidfile = tempname()
-    args = ["run", "--cidfile", cidfile]
-    if detach
-        push!(args, "-d")
-    end
-    if name !== nothing
-        push!(args, "--name", name)
-    end
-    # Add port mappings. A host port of 0 publishes the container port to an
-    # ephemeral host port chosen by the OS.
-    for (container_port, host_port) in ports
-        if host_port == 0
-            push!(args, "-p", string(container_port))
-        else
-            push!(args, "-p", string(host_port, ":", container_port))
+    return mktempdir() do temp_dir
+        cidfile = joinpath(temp_dir, "container.cid")
+        args = ["run", "--cidfile", cidfile]
+        if detach
+            push!(args, "-d")
         end
-    end
-    # Add volume mounts.
-    for (container_path, host_path) in volumes
-        push!(args, "-v", string(host_path, ":", container_path))
-    end
-    # Add environment variables. Only the *names* go on the command line
-    # (visible in the host's process list); the values travel via the docker
-    # CLI process environment, which `-e KEY` (without a value) forwards.
-    for (key, _) in environment
-        push!(args, "-e", key)
-    end
-    # Add labels.
-    for (key, val) in labels
-        push!(args, "--label", string(key, "=", val))
-    end
-    # Base image.
-    push!(args, image_ref(image))
-    # Append command if provided.
-    if command !== nothing
-        append!(args, command)
-    end
-    try
-        try
-            docker_read(args; env=isempty(environment) ? nothing : environment)
-        catch e
-            if e isa DockerError
-                cid = isfile(cidfile) ? String(chomp(read(cidfile, String))) : ""
-                if !isempty(cid)
-                    if !detach && e.exitcode != 125
-                        # A foreground run's CLI exit status is the *container's*
-                        # exit status — the run itself succeeded. (125 is the
-                        # docker CLI's own-failure code.)
-                        return cid
-                    end
-                    # The container was created but docker still failed (e.g.
-                    # a host port conflict at start): remove it rather than
-                    # leaking it, since the caller gets no handle.
-                    try
-                        docker_rm(cid; force=true)
-                    catch cleanup_err
-                        @debug "Failed to remove container after docker run failure" container_id=cid exception=(cleanup_err, catch_backtrace())
+        if name !== nothing
+            push!(args, "--name", name)
+        end
+        # Add port mappings. A host port of 0 publishes the container port to an
+        # ephemeral host port chosen by the OS.
+        for (container_port, host_port) in ports
+            if host_port == 0
+                push!(args, "-p", string(container_port))
+            else
+                push!(args, "-p", string(host_port, ":", container_port))
+            end
+        end
+        # Add volume mounts.
+        for (container_path, host_path) in volumes
+            push!(args, "-v", string(host_path, ":", container_path))
+        end
+        # Add labels.
+        for (key, val) in labels
+            push!(args, "--label", string(key, "=", val))
+        end
+        return _with_env_file(environment) do env_path
+            env_path !== nothing && push!(args, "--env-file", env_path)
+            # Base image.
+            push!(args, image_ref(image))
+            # Append command if provided.
+            command !== nothing && append!(args, command)
+            try
+                docker_read(args)
+            catch e
+                if e isa DockerError
+                    cid = isfile(cidfile) ? String(chomp(read(cidfile, String))) : ""
+                    if !isempty(cid)
+                        if !detach && e.exitcode != 125
+                            # A foreground run's CLI exit status is the
+                            # container's exit status. Docker reserves 125 for
+                            # its own failures.
+                            return cid
+                        end
+                        # The container was created but docker still failed
+                        # (e.g. a host port conflict at start): remove it rather
+                        # than leaking it, since the caller gets no handle.
+                        try
+                            docker_rm(cid; force=true)
+                        catch cleanup_err
+                            @debug "Failed to remove container after docker run failure" container_id=cid exception=(cleanup_err, catch_backtrace())
+                        end
                     end
                 end
+                rethrow()
             end
-            rethrow()
+            return String(chomp(read(cidfile, String)))
         end
-        return String(chomp(read(cidfile, String)))
-    finally
-        rm(cidfile; force=true)
     end
 end
 
@@ -325,12 +342,6 @@ function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractSt
     if workdir !== nothing
         push!(args, "-w", String(workdir))
     end
-    if env !== nothing
-        # names only on the command line; values via the CLI's environment
-        for (key, _) in env
-            push!(args, "-e", String(key))
-        end
-    end
     if env_file !== nothing
         if env_file isa AbstractVector{<:AbstractString}
             for file in env_file
@@ -340,13 +351,17 @@ function docker_exec(container_id::String, exec_cmd::AbstractVector{<:AbstractSt
             push!(args, "--env-file", String(env_file))
         end
     end
-    push!(args, container_id)
-    for part in exec_cmd
-        push!(args, String(part))
-    end
     env_map = env === nothing ? nothing :
         Dict{String, String}(String(k) => String(v) for (k, v) in env)
-    return docker_read(args; env=env_map)
+    return _with_env_file(env_map) do generated_env_file
+        # Explicit `env` entries override values from user-provided env files.
+        generated_env_file !== nothing && push!(args, "--env-file", generated_env_file)
+        push!(args, container_id)
+        for part in exec_cmd
+            push!(args, String(part))
+        end
+        return docker_read(args)
+    end
 end
 
 """

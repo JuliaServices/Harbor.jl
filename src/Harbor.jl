@@ -220,8 +220,8 @@ function Base.show(io::IO, container::Container)
     if isempty(container.options.environment)
         println(io, "      (none)")
     else
-        for (key, val) in container.options.environment
-            println(io, "      ", key, " = ", val)
+        for key in keys(container.options.environment)
+            println(io, "      ", key, " = <redacted>")
         end
     end
 
@@ -402,10 +402,10 @@ returns a `Container` handle.
 - With `detach=false` the call blocks until the container exits and returns the
   handle even if the container's command exited with a non-zero status; use
   [`logs`](@ref) and [`inspect`](@ref) (`State.ExitCode`) to diagnose.
-- `environment` values are forwarded through the docker CLI's process
-  environment (not its command line); note that names the docker CLI itself
-  reads (`DOCKER_HOST`, `DOCKER_CONFIG`, ...) therefore also affect that one
-  CLI invocation.
+- `environment` values are passed through a mode-0600 temporary `--env-file`
+  that is deleted after the docker CLI reads it. Values are not placed on the
+  command line or in the docker CLI's own environment. Because Docker's env-file
+  format is line-based, names and values cannot contain NUL, CR, or LF.
 
 The started container is force-removed by a garbage-collection finalizer as a
 safety net; prefer [`with_container`](@ref) (or explicit [`remove!`](@ref)) for
@@ -495,9 +495,10 @@ Runs a command inside the specified container and returns its stdout. Throws a
 [`DockerError`](@ref) carrying the exit code and captured stderr if the command
 fails. Supported keywords mirror `docker exec` flags: `env`, `workdir`, `user`,
 `detach`, `interactive`, `tty`, `privileged`, `env_file`, `detach_keys`.
-`env` values are forwarded through the docker CLI's process environment (not
-its command line), so names the docker CLI itself reads (`DOCKER_HOST`, ...)
-also affect that one CLI invocation.
+`env` values are passed through a mode-0600 temporary `--env-file` that is
+deleted after the docker CLI reads it. They are not placed on the command line
+or in the docker CLI's own environment. Names and values cannot contain NUL,
+CR, or LF.
 """
 function exec(container::Container, exec_cmd::AbstractVector{<:AbstractString}; kw...)::String
     @debug "Executing command in container" container_id=container.id
