@@ -412,8 +412,12 @@ function check_wait_strategy(s::WaitForHTTP, container::Container; timeout::Real
         write(sock, "GET $path HTTP/1.1\r\nHost: $host_header\r\nConnection: close\r\n\r\n")
         status_line = _read_http_status_line(sock, timeout)
         status_line === nothing && return false
-        parts = split(rstrip(status_line, '\r'), ' '; limit=3)
-        return length(parts) >= 2 && tryparse(Int, parts[2]) == s.expected_status
+        # Do not accept an arbitrary TCP service whose first line happens to
+        # contain the expected number. Require an HTTP-version and a three-digit
+        # status code in the response status line.
+        response = match(r"^HTTP/\d+\.\d+ ([0-9]{3})(?: |$)",
+                         rstrip(status_line, '\r'))
+        return response !== nothing && tryparse(Int, response.captures[1]) == s.expected_status
     catch e
         e isa InterruptException && rethrow()
         e isa Base.IOError || e isa EOFError || rethrow()

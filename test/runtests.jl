@@ -129,6 +129,9 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         status, ready = probe_server(nothing, 0.2)
         @test status === :ok
         @test !ready
+        status, ready = probe_server("NOT-HTTP 200 OK\r\n", 0.2)
+        @test status === :ok
+        @test !ready
     end
 
     @testset "port and wait timing validation" begin
