@@ -111,7 +111,7 @@ const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, WaitForHealthy,
 normalize_wait_strategy(::Nothing) = nothing
 normalize_wait_strategy(f::Function) = CustomWait((f,))
 function normalize_wait_strategy(s::NamedTuple)
-    if length(s) == 1 && haskey(s, :port) && s.port isa Integer
+    if length(s) == 1 && haskey(s, :port) && s.port isa Integer && !(s.port isa Bool)
         return WaitForPort((Int(s.port),))
     elseif length(s) == 1 && haskey(s, :pattern) && s.pattern isa Union{AbstractString, Regex}
         return WaitForLog((s.pattern isa Regex ? s.pattern : String(s.pattern),))
@@ -176,7 +176,11 @@ end
 function Base.show(io::IO, container::Container)
     println(io, "Container:")
     println(io, "  ID: ", container.id)
-    println(io, "  Image: ", container.image.name, ":", container.image.tag)
+    if isempty(container.image.tag)
+        println(io, "  Image: ", container.image.name)
+    else
+        println(io, "  Image: ", container.image.name, ":", container.image.tag)
+    end
     if container.image.digest !== nothing
         println(io, "         Digest: ", container.image.digest)
     end
@@ -319,11 +323,41 @@ end
 check_wait_strategy(s::CustomWait, container::Container) = s.check(container) === true
 
 """
+    ContainerExitedError(strategy, logs)
+
+Thrown when a container exits before satisfying its wait strategy — waiting
+longer cannot succeed, so the wait aborts immediately instead of running out
+the full `wait_timeout`. Carries the container's logs for diagnosis.
+"""
+struct ContainerExitedError <: Exception
+    strategy::WaitStrategy
+    logs::String
+end
+
+function Base.showerror(io::IO, e::ContainerExitedError)
+    print(io, "ContainerExitedError: container exited before satisfying wait strategy ",
+          e.strategy)
+    if !isempty(strip(e.logs))
+        print(io, "\ncontainer logs:\n", rstrip(e.logs))
+    end
+end
+
+# best-effort log fetch for wait failure errors
+function _logs_or_empty(container::Container)
+    try
+        docker_logs(container.id; follow=false, tail="all")
+    catch
+        ""
+    end
+end
+
+"""
     wait_for(container::Container)
 
 Waits until the container's wait strategy condition is met or `wait_timeout`
 expires. Throws a [`WaitTimeoutError`](@ref) (including the container's logs)
-if the condition isn't satisfied in time.
+if the condition isn't satisfied in time, or a [`ContainerExitedError`](@ref)
+as soon as the container exits without having satisfied the strategy.
 """
 function wait_for(container::Container)
     strategy = container.options.wait_strategy
@@ -331,13 +365,15 @@ function wait_for(container::Container)
     start_time = time()
     while true
         check_wait_strategy(strategy, container) && return nothing
+        if !is_running(container)
+            # the strategy can no longer become true (logs are final; ports/
+            # http/health are gone) — but re-check once to close the race
+            # where the condition was met just before the container exited
+            check_wait_strategy(strategy, container) && return nothing
+            throw(ContainerExitedError(strategy, _logs_or_empty(container)))
+        end
         if time() - start_time > container.options.wait_timeout
-            logs_output = try
-                docker_logs(container.id; follow=false, tail="all")
-            catch
-                ""
-            end
-            throw(WaitTimeoutError(strategy, container.options.wait_timeout, logs_output))
+            throw(WaitTimeoutError(strategy, container.options.wait_timeout, _logs_or_empty(container)))
         end
         sleep(container.options.wait_interval)
     end
@@ -349,8 +385,9 @@ run!(image::Union{Image, AbstractString}; name=nothing, ports=Dict{Int,Int}(),
      command=nothing, detach::Bool=true, wait_strategy=nothing,
      wait_timeout=60.0, wait_interval=1.0) -> Container
 
-Starts a container from the provided `Image` (or image reference string, which
-is pulled first) and returns a `Container` handle.
+Starts a container from the provided `Image` — or an image reference string,
+which is resolved against local images first and pulled only when absent — and
+returns a `Container` handle.
 
 - `ports` maps container ports to host ports; a host port of `0` publishes the
   container port on an OS-assigned ephemeral port (see [`host_port`](@ref)).
@@ -359,7 +396,9 @@ is pulled first) and returns a `Container` handle.
 - `wait_strategy` may be `(port=...,)`, `(pattern=string_or_regex,)`,
   `(url=..., expected_status=...)`, `(healthy=true,)`, or a function
   `container -> Bool`. If the strategy is not satisfied within `wait_timeout`
-  seconds, the container is removed and a [`WaitTimeoutError`](@ref) is thrown.
+  seconds (or the container exits before satisfying it), the container is
+  removed and a [`WaitTimeoutError`](@ref) (or [`ContainerExitedError`](@ref))
+  is thrown.
 - With `detach=false` the call blocks until the container exits and returns the
   handle even if the container's command exited with a non-zero status; use
   [`logs`](@ref) and [`inspect`](@ref) (`State.ExitCode`) to diagnose.
@@ -601,8 +640,14 @@ function ps(; all::Bool=true)::Vector{Container}
         end
         config = get(info, "Config", Dict{String, Any}())
         hostconfig = get(info, "HostConfig", Dict{String, Any}())
-        img_name, img_tag, img_digest = _split_ref(get(config, "Image", "unknown"))
-        image = Image(img_name, something(img_tag, "latest"), img_digest)
+        img_raw = get(config, "Image", "unknown")
+        if startswith(img_raw, "sha256:")
+            # a raw image id, not a name[:tag][@digest] reference
+            image = Image(String(img_raw), "", nothing)
+        else
+            img_name, img_tag, img_digest = _split_ref(img_raw)
+            image = Image(img_name, something(img_tag, "latest"), img_digest)
+        end
         status = Symbol(get(get(info, "State", Dict{String, Any}()), "Status", "unknown"))
         created_raw = get(info, "Created", nothing)
         created_at = created_raw isa AbstractString ? _parse_docker_timestamp(created_raw) : nothing

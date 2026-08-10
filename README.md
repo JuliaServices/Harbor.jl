@@ -66,8 +66,10 @@ Harbor.with_container("nginx"; ports=Dict(80 => 0)) do container
 end
 ```
 
-When `ports` is given and no `wait_strategy` is specified, `run!` waits until
-the first mapped port accepts connections before returning.
+When `ports` is given, no `wait_strategy` is specified, and the run is
+detached, `run!` waits until the lowest mapped container port is genuinely
+ready before returning (a connection must survive docker's userland proxy,
+not merely be accepted by it).
 
 ### Wait strategies
 

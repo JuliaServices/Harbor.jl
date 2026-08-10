@@ -6,6 +6,12 @@ for leftover in ["harbor-ps-safety-test", "harbor-wait-timeout-test", "harbor-na
     run(pipeline(ignorestatus(`docker rm -f $leftover`); stdout=devnull, stderr=devnull))
 end
 
+# Some testsets are host-destructive beyond this suite's own artifacts:
+# prune() removes ALL Harbor-labeled containers on the machine (other
+# projects' included), and the image-removal tests delete the local alpine
+# and busybox images. Run those only on CI.
+const IS_CI = get(ENV, "CI", "") == "true"
+
 # An OS-assigned free host port (closed again immediately — a small race, but
 # far less collision-prone than hardcoded ports on shared CI runners).
 function free_port()
@@ -47,6 +53,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test_throws ArgumentError Harbor.normalize_wait_strategy((pattern=5,))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((port="80",))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((healthy=1,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((port=true,))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((port=1, pattern="x"))
         @test_throws ArgumentError Harbor.normalize_wait_strategy(42)
     end
@@ -276,6 +283,21 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test length(Harbor.docker_ps(all=true, label=Harbor.HARBOR_LABEL * "=true")) == before
     end
 
+    @testset "wait aborts as soon as the container exits" begin
+        before = time()
+        err = try
+            Harbor.run!(ALPINE; command=["sh", "-c", "echo died-early; exit 1"],
+                        wait_strategy=(pattern="never-going-to-appear",),
+                        wait_timeout=60.0, wait_interval=0.5)
+            nothing
+        catch e
+            e
+        end
+        @test err isa Harbor.ContainerExitedError
+        @test occursin("died-early", sprint(showerror, err))
+        @test time() - before < 30  # nowhere near the 60s timeout
+    end
+
     @testset "wait timeout removes the container and reports logs" begin
         img = ALPINE
         err = try
@@ -352,7 +374,11 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         finalize(cont)
     end
 
-    @testset "prune" begin
+    if !IS_CI
+        @info "Skipping prune and image-removal testsets outside CI (they remove ALL Harbor-labeled containers and the local alpine/busybox images)"
+    end
+
+    IS_CI && @testset "prune" begin
         img = ALPINE
         c1 = Harbor.run!(img; command=["sleep", "60"])
         c2 = Harbor.run!(img; command=["sleep", "60"])
@@ -366,12 +392,12 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
     end
 
     # Last: removing images (containers referencing them are gone by now).
-    @testset "remove image" begin
+    IS_CI && @testset "remove image" begin
         @test Harbor.remove(BUSYBOX; force=true)
         @test !any(i -> i.name == "busybox" && i.tag == "latest", Harbor.images())
     end
 
-    @testset "digest-pinned pull" begin
+    IS_CI && @testset "digest-pinned pull" begin
         @test ALPINE.digest !== nothing
         pinned = Harbor.pull("alpine@" * ALPINE.digest)
         @test pinned.digest == ALPINE.digest
