@@ -235,11 +235,28 @@ end
 function check_wait_strategy(s::WaitForPort, container::Container)
     hp = get(container.ports, s.port, nothing)
     hp === nothing && throw(ArgumentError("wait strategy (port=$(s.port),) has no matching entry in the container's port mappings"))
-    try
-        close(connect("127.0.0.1", hp))
-        return true
+    sock = try
+        connect("127.0.0.1", hp)
     catch
         return false  # port is not yet open
+    end
+    try
+        # Docker's userland proxy (docker-proxy/vpnkit) accepts connections
+        # itself and only then dials the container, closing on failure — so a
+        # successful connect alone proves nothing about the service. Consider
+        # the port ready only if the connection is still open shortly after
+        # (or the service already sent data).
+        closed = @async try
+            eof(sock)
+        catch
+            true  # reset/aborted counts as closed
+        end
+        if timedwait(() -> istaskdone(closed), 0.25) === :ok && fetch(closed) === true
+            return false  # proxy accepted, then closed: backend not listening
+        end
+        return true
+    finally
+        close(sock)
     end
 end
 
