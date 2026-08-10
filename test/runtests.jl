@@ -53,7 +53,12 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test_throws ArgumentError Harbor.normalize_wait_strategy((pattern=5,))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((port="80",))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((healthy=1,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((healthy=false,))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((port=true,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((port=0,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((port=65536,))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((url="http://x", expected_status=true))
+        @test_throws ArgumentError Harbor.normalize_wait_strategy((url="http://x", expected_status=99))
         @test_throws ArgumentError Harbor.normalize_wait_strategy((port=1, pattern="x"))
         @test_throws ArgumentError Harbor.normalize_wait_strategy(42)
     end
@@ -72,6 +77,51 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test Harbor._parse_http_url("http://localhost:9/a/b?c=1") == ("localhost", 9, "/a/b?c=1")
         @test_throws ArgumentError Harbor._parse_http_url("https://localhost/x")
         @test_throws ArgumentError Harbor._parse_http_url("ftp://x")
+        @test_throws ArgumentError Harbor._parse_http_url("http://localhost:65536/")
+    end
+
+    @testset "HTTP wait reads only a bounded status line" begin
+        function probe_server(response::Union{Nothing, String}, probe_timeout::Float64)
+            server = listen(ip"127.0.0.1", 0)
+            port = Int(getsockname(server)[2])
+            release = Channel{Nothing}(1)
+            server_task = errormonitor(@async begin
+                sock = accept(server)
+                response === nothing || write(sock, response)
+                take!(release)
+                close(sock)
+            end)
+            strategy = Harbor.normalize_wait_strategy((url="http://127.0.0.1:$port/", expected_status=200))
+            opts = Harbor.RunOptions(; wait_strategy=strategy)
+            container = Harbor.Container("probe", Harbor.Image("none"), :running,
+                                         now(), opts)
+            probe = errormonitor(@async Harbor.check_wait_strategy(strategy, container;
+                                                                    timeout=probe_timeout))
+            status = timedwait(() -> istaskdone(probe), 1.0)
+            put!(release, nothing)
+            close(server)
+            wait(server_task)
+            return status, fetch(probe)
+        end
+        status, ready = probe_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0.2)
+        @test status === :ok
+        @test ready
+        status, ready = probe_server(nothing, 0.2)
+        @test status === :ok
+        @test !ready
+    end
+
+    @testset "port and wait timing validation" begin
+        @test Harbor._normalize_ports(Dict(80 => 0)) == Dict(80 => 0)
+        @test_throws ArgumentError Harbor._normalize_ports(Dict(true => 0))
+        @test_throws ArgumentError Harbor._normalize_ports(Dict(0 => 0))
+        @test_throws ArgumentError Harbor._normalize_ports(Dict(80 => -1))
+        @test_throws ArgumentError Harbor._normalize_ports(Dict(80 => 65536))
+        @test Harbor._validate_wait_timing(0.0, 0.1) === nothing
+        @test_throws ArgumentError Harbor._validate_wait_timing(-1.0, 0.1)
+        @test_throws ArgumentError Harbor._validate_wait_timing(Inf, 0.1)
+        @test_throws ArgumentError Harbor._validate_wait_timing(1.0, 0.0)
+        @test_throws ArgumentError Harbor._validate_wait_timing(1.0, NaN)
     end
 
     # Pull an image and verify its properties.
@@ -204,6 +254,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
             hp = Harbor.host_port(cont, 8080)
             @test hp > 0
             @test_throws ArgumentError Harbor.host_port(cont, 9999)
+            @test_throws ArgumentError Harbor.host_port(cont, true)
             # the ephemeral port really is reachable
             sock = connect("127.0.0.1", hp)
             write(sock, "GET /nope HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")

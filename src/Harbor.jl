@@ -110,16 +110,42 @@ const WaitStrategy = Union{WaitForPort, WaitForLog, WaitForHTTP, WaitForHealthy,
 # the wait timeout expired).
 normalize_wait_strategy(::Nothing) = nothing
 normalize_wait_strategy(f::Function) = CustomWait((f,))
+
+function _port_number(value, description::AbstractString; allow_zero::Bool=false)::Int
+    if !(value isa Integer) || value isa Bool
+        throw(ArgumentError("$description must be an integer, got $(repr(value))"))
+    end
+    port = try
+        Int(value)
+    catch e
+        e isa InexactError || rethrow()
+        throw(ArgumentError("$description is outside the supported integer range: $(repr(value))"))
+    end
+    lower = allow_zero ? 0 : 1
+    lower <= port <= 65535 || throw(ArgumentError("$description must be between $lower and 65535, got $port"))
+    return port
+end
+
 function normalize_wait_strategy(s::NamedTuple)
     if length(s) == 1 && haskey(s, :port) && s.port isa Integer && !(s.port isa Bool)
-        return WaitForPort((Int(s.port),))
+        return WaitForPort((_port_number(s.port, "wait strategy port"),))
     elseif length(s) == 1 && haskey(s, :pattern) && s.pattern isa Union{AbstractString, Regex}
         return WaitForLog((s.pattern isa Regex ? s.pattern : String(s.pattern),))
     elseif length(s) == 2 && haskey(s, :url) && haskey(s, :expected_status) &&
-           s.url isa AbstractString && s.expected_status isa Integer
-        return WaitForHTTP((String(s.url), Int(s.expected_status)))
-    elseif length(s) == 1 && haskey(s, :healthy) && s.healthy isa Bool
-        return WaitForHealthy((s.healthy,))
+           s.url isa AbstractString && s.expected_status isa Integer &&
+           !(s.expected_status isa Bool)
+        status = try
+            Int(s.expected_status)
+        catch e
+            e isa InexactError || rethrow()
+            throw(ArgumentError("expected HTTP status is outside the supported integer range: $(repr(s.expected_status))"))
+        end
+        100 <= status <= 599 || throw(ArgumentError("expected HTTP status must be between 100 and 599, got $status"))
+        url = String(s.url)
+        _parse_http_url(url)
+        return WaitForHTTP((url, status))
+    elseif length(s) == 1 && haskey(s, :healthy) && s.healthy === true
+        return WaitForHealthy((true,))
     elseif length(s) == 1 && haskey(s, :check) && s.check isa Function
         return CustomWait((s.check,))
     end
@@ -128,6 +154,26 @@ function normalize_wait_strategy(s::NamedTuple)
 end
 normalize_wait_strategy(other) =
     throw(ArgumentError("wait_strategy must be a NamedTuple or a function, got $(typeof(other))"))
+
+function _normalize_ports(ports)::Dict{Int, Int}
+    normalized = Dict{Int, Int}()
+    for (container_port, host_port) in ports
+        container_port = _port_number(container_port, "container port")
+        host_port = _port_number(host_port, "host port"; allow_zero=true)
+        haskey(normalized, container_port) &&
+            throw(ArgumentError("container port $container_port is mapped more than once"))
+        normalized[container_port] = host_port
+    end
+    return normalized
+end
+
+function _validate_wait_timing(wait_timeout::Float64, wait_interval::Float64)
+    isfinite(wait_timeout) && wait_timeout >= 0 ||
+        throw(ArgumentError("wait_timeout must be finite and non-negative, got $wait_timeout"))
+    isfinite(wait_interval) && wait_interval > 0 ||
+        throw(ArgumentError("wait_interval must be finite and positive, got $wait_interval"))
+    return nothing
+end
 
 @kwdef struct RunOptions
     name::Union{Nothing, String} = nothing
@@ -257,20 +303,66 @@ function _parse_http_url(url::AbstractString)
     m = match(r"^http://([^/:]+)(?::(\d+))?(/.*)?$", url)
     m === nothing && throw(ArgumentError("WaitForHTTP only supports plain http://host[:port][/path] URLs, got: $url"))
     host = String(m.captures[1])
-    port = m.captures[2] === nothing ? 80 : parse(Int, m.captures[2])
+    port = m.captures[2] === nothing ? 80 : _port_number(parse(BigInt, m.captures[2]), "HTTP URL port")
     path = m.captures[3] === nothing ? "/" : String(m.captures[3])
     return host, port, path
 end
 
+# Connect a socket without allowing one probe to block the complete wait loop.
+function _connect_with_timeout(host::AbstractString, port::Int, timeout::Real)
+    sock = TCPSocket()
+    connected = @async try
+        connect(sock, host, port)
+        true
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || e isa Sockets.DNSError || rethrow()
+        return false
+    end
+    limit = max(Float64(timeout), 0.001)
+    status = timedwait(() -> istaskdone(connected), limit; pollint=min(0.01, limit))
+    if status !== :ok
+        close(sock)
+        return nothing
+    end
+    if fetch(connected) !== true
+        close(sock)
+        return nothing
+    end
+    return sock
+end
+
+# Read only the HTTP status line. The full response can be unbounded or use a
+# persistent connection, and readiness depends only on the status code.
+function _read_http_status_line(sock::TCPSocket, timeout::Real)
+    reader = @async try
+        bytes = UInt8[]
+        while length(bytes) < 8192
+            byte = read(sock, UInt8)
+            byte == UInt8('\n') && return String(bytes)
+            push!(bytes, byte)
+        end
+        return nothing
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || e isa EOFError || rethrow()
+        return nothing
+    end
+    limit = max(Float64(timeout), 0.001)
+    status = timedwait(() -> istaskdone(reader), limit; pollint=min(0.01, limit))
+    if status !== :ok
+        close(sock)
+        return nothing
+    end
+    return fetch(reader)
+end
+
 # One readiness probe per strategy; returns true when the condition holds.
-function check_wait_strategy(s::WaitForPort, container::Container)
+function check_wait_strategy(s::WaitForPort, container::Container; timeout::Real=1.0)
     hp = get(container.ports, s.port, nothing)
     hp === nothing && throw(ArgumentError("wait strategy (port=$(s.port),) has no matching entry in the container's port mappings"))
-    sock = try
-        connect("127.0.0.1", hp)
-    catch
-        return false  # port is not yet open
-    end
+    sock = _connect_with_timeout("127.0.0.1", hp, timeout)
+    sock === nothing && return false
     try
         # Docker's userland proxy (docker-proxy/vpnkit) accepts connections
         # itself and only then dials the container, closing on failure — so a
@@ -282,7 +374,8 @@ function check_wait_strategy(s::WaitForPort, container::Container)
         catch
             true  # reset/aborted counts as closed
         end
-        if timedwait(() -> istaskdone(closed), 0.25) === :ok && fetch(closed) === true
+        survival = min(0.25, max(Float64(timeout), 0.001))
+        if timedwait(() -> istaskdone(closed), survival; pollint=min(0.01, survival)) === :ok && fetch(closed) === true
             return false  # proxy accepted, then closed: backend not listening
         end
         return true
@@ -291,36 +384,39 @@ function check_wait_strategy(s::WaitForPort, container::Container)
     end
 end
 
-check_wait_strategy(s::WaitForLog, container::Container) =
+check_wait_strategy(s::WaitForLog, container::Container; timeout::Real=1.0) =
     occursin(s.pattern, docker_logs(container.id; follow=false, tail="all"))
 
-function check_wait_strategy(s::WaitForHTTP, container::Container)
+function check_wait_strategy(s::WaitForHTTP, container::Container; timeout::Real=1.0)
     host, port, path = _parse_http_url(s.url)
+    sock = _connect_with_timeout(host, port, timeout)
+    sock === nothing && return false
     try
-        sock = connect(host, port)
-        try
-            write(sock, "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n")
-            response = read(sock, String)
-            status_line = first(split(response, "\r\n"; limit=2))
-            parts = split(status_line, ' '; limit=3)
-            return length(parts) >= 2 && tryparse(Int, parts[2]) == s.expected_status
-        finally
-            close(sock)
-        end
-    catch
+        host_header = port == 80 ? host : string(host, ":", port)
+        write(sock, "GET $path HTTP/1.1\r\nHost: $host_header\r\nConnection: close\r\n\r\n")
+        status_line = _read_http_status_line(sock, timeout)
+        status_line === nothing && return false
+        parts = split(rstrip(status_line, '\r'), ' '; limit=3)
+        return length(parts) >= 2 && tryparse(Int, parts[2]) == s.expected_status
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || e isa EOFError || rethrow()
         return false  # connection refused / reset while the server starts up
+    finally
+        isopen(sock) && close(sock)
     end
 end
 
-function check_wait_strategy(s::WaitForHealthy, container::Container)
-    s.healthy || return true
+function check_wait_strategy(s::WaitForHealthy, container::Container; timeout::Real=1.0)
+    s.healthy || throw(ArgumentError("healthy wait strategy must specify (healthy=true,)"))
     info = docker_inspect_container(container.id)
     health = get(get(info, "State", Dict{String, Any}()), "Health", nothing)
     health === nothing && throw(ArgumentError("wait strategy (healthy=true,) requires the image to define a HEALTHCHECK, but the container has none"))
     return get(health, "Status", "") == "healthy"
 end
 
-check_wait_strategy(s::CustomWait, container::Container) = s.check(container) === true
+check_wait_strategy(s::CustomWait, container::Container; timeout::Real=1.0) =
+    s.check(container) === true
 
 """
     ContainerExitedError(strategy, logs)
@@ -362,20 +458,24 @@ as soon as the container exits without having satisfied the strategy.
 function wait_for(container::Container)
     strategy = container.options.wait_strategy
     strategy === nothing && return nothing
-    start_time = time()
+    start_time = time_ns()
     while true
-        check_wait_strategy(strategy, container) && return nothing
+        elapsed = Float64(time_ns() - start_time) / 1.0e9
+        remaining = max(container.options.wait_timeout - elapsed, 0.0)
+        probe_timeout = min(container.options.wait_interval, max(remaining, 0.001))
+        check_wait_strategy(strategy, container; timeout=probe_timeout) && return nothing
         if !is_running(container)
             # the strategy can no longer become true (logs are final; ports/
             # http/health are gone) — but re-check once to close the race
             # where the condition was met just before the container exited
-            check_wait_strategy(strategy, container) && return nothing
+            check_wait_strategy(strategy, container; timeout=probe_timeout) && return nothing
             throw(ContainerExitedError(strategy, _logs_or_empty(container)))
         end
-        if time() - start_time > container.options.wait_timeout
+        elapsed = Float64(time_ns() - start_time) / 1.0e9
+        if elapsed >= container.options.wait_timeout
             throw(WaitTimeoutError(strategy, container.options.wait_timeout, _logs_or_empty(container)))
         end
-        sleep(container.options.wait_interval)
+        sleep(min(container.options.wait_interval, container.options.wait_timeout - elapsed))
     end
 end
 
@@ -412,7 +512,7 @@ safety net; prefer [`with_container`](@ref) (or explicit [`remove!`](@ref)) for
 deterministic cleanup.
 """
 function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)::Container
-    ports = Dict{Int, Int}(ports)
+    ports = _normalize_ports(ports)
     wait_strategy = normalize_wait_strategy(wait_strategy)
     # Auto-wait on the lowest mapped container port — but only for detached
     # runs: a foreground run has already exited, so its ports are gone.
@@ -420,6 +520,7 @@ function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)
         wait_strategy = WaitForPort((Int(minimum(keys(ports))),))
     end
     opts = RunOptions(; ports, wait_strategy, kw...)
+    _validate_wait_timing(opts.wait_timeout, opts.wait_interval)
     # Call underlying runtime to create and start the container. The label
     # marks the container as Harbor-managed so `prune` can find leaked ones.
     cid = docker_run(image; name=opts.name, ports=opts.ports, volumes=opts.volumes,
@@ -461,7 +562,8 @@ ephemeral host port (`ports=Dict(container_port => 0)`). Throws an
 `ArgumentError` if the container port is not published.
 """
 function host_port(container::Container, container_port::Integer)::Int
-    hp = get(container.ports, Int(container_port), nothing)
+    container_port = _port_number(container_port, "container port")
+    hp = get(container.ports, container_port, nothing)
     hp === nothing && throw(ArgumentError("container port $container_port is not published to a host port (published: $(container.ports))"))
     return hp
 end
