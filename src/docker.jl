@@ -158,7 +158,30 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
         append!(args, command)
     end
     try
-        docker_read(args; env=isempty(environment) ? nothing : environment)
+        try
+            docker_read(args; env=isempty(environment) ? nothing : environment)
+        catch e
+            if e isa DockerError
+                cid = isfile(cidfile) ? String(chomp(read(cidfile, String))) : ""
+                if !isempty(cid)
+                    if !detach && e.exitcode != 125
+                        # A foreground run's CLI exit status is the *container's*
+                        # exit status — the run itself succeeded. (125 is the
+                        # docker CLI's own-failure code.)
+                        return cid
+                    end
+                    # The container was created but docker still failed (e.g.
+                    # a host port conflict at start): remove it rather than
+                    # leaking it, since the caller gets no handle.
+                    try
+                        docker_rm(cid; force=true)
+                    catch cleanup_err
+                        @debug "Failed to remove container after docker run failure" container_id=cid exception=(cleanup_err, catch_backtrace())
+                    end
+                end
+            end
+            rethrow()
+        end
         return String(chomp(read(cidfile, String)))
     finally
         rm(cidfile; force=true)

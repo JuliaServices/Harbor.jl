@@ -310,14 +310,19 @@ is pulled first) and returns a `Container` handle.
 
 - `ports` maps container ports to host ports; a host port of `0` publishes the
   container port on an OS-assigned ephemeral port (see [`host_port`](@ref)).
-  When `ports` is non-empty and no `wait_strategy` is given, `run!` waits for
-  the first mapped port to accept connections.
+  When `ports` is non-empty, no `wait_strategy` is given, and the run is
+  detached, `run!` waits for the lowest mapped container port to be ready.
 - `wait_strategy` may be `(port=...,)`, `(pattern=string_or_regex,)`,
   `(url=..., expected_status=...)`, `(healthy=true,)`, or a function
   `container -> Bool`. If the strategy is not satisfied within `wait_timeout`
   seconds, the container is removed and a [`WaitTimeoutError`](@ref) is thrown.
-- With `detach=false` the call blocks until the container exits; use
-  [`logs`](@ref) to retrieve its output.
+- With `detach=false` the call blocks until the container exits and returns the
+  handle even if the container's command exited with a non-zero status; use
+  [`logs`](@ref) and [`inspect`](@ref) (`State.ExitCode`) to diagnose.
+- `environment` values are forwarded through the docker CLI's process
+  environment (not its command line); note that names the docker CLI itself
+  reads (`DOCKER_HOST`, `DOCKER_CONFIG`, ...) therefore also affect that one
+  CLI invocation.
 
 The started container is force-removed by a garbage-collection finalizer as a
 safety net; prefer [`with_container`](@ref) (or explicit [`remove!`](@ref)) for
@@ -326,8 +331,10 @@ deterministic cleanup.
 function run!(image::Image; ports=Dict{Int,Int}(), wait_strategy=nothing, kw...)::Container
     ports = Dict{Int, Int}(ports)
     wait_strategy = normalize_wait_strategy(wait_strategy)
-    if wait_strategy === nothing && !isempty(ports)
-        wait_strategy = WaitForPort((Int(first(keys(ports))),))
+    # Auto-wait on the lowest mapped container port — but only for detached
+    # runs: a foreground run has already exited, so its ports are gone.
+    if wait_strategy === nothing && !isempty(ports) && get(kw, :detach, true)
+        wait_strategy = WaitForPort((Int(minimum(keys(ports))),))
     end
     opts = RunOptions(; ports, wait_strategy, kw...)
     # Call underlying runtime to create and start the container. The label
