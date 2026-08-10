@@ -1,10 +1,11 @@
 using Test, Harbor, Dates, Sockets
 
-# Remove containers a previously crashed test run may have left behind, so
-# fixed-name `docker run`s below don't collide.
-for leftover in ["harbor-ps-safety-test", "harbor-wait-timeout-test", "harbor-name-reuse-test"]
-    run(pipeline(ignorestatus(`docker rm -f $leftover`); stdout=devnull, stderr=devnull))
-end
+# Names are unique per test process. A test run must never delete a container
+# merely because another user or project chose the same fixed name.
+const TEST_RUN_SUFFIX = string(getpid(), "-", time_ns())
+const PS_SAFETY_NAME = "harbor-ps-safety-" * TEST_RUN_SUFFIX
+const WAIT_TIMEOUT_NAME = "harbor-wait-timeout-" * TEST_RUN_SUFFIX
+const NAME_REUSE_NAME = "harbor-name-reuse-" * TEST_RUN_SUFFIX
 
 # Some testsets are host-destructive beyond this suite's own artifacts:
 # prune() removes ALL Harbor-labeled containers on the machine (other
@@ -218,7 +219,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         img = ALPINE
         tmp = mktempdir()
         hp = free_port()
-        cont = Harbor.run!(img; name="harbor-ps-safety-test", command=["sleep", "60"],
+        cont = Harbor.run!(img; name=PS_SAFETY_NAME, command=["sleep", "60"],
                            volumes=Dict("/harbor-data" => tmp),
                            environment=Dict("HARBOR_PS_TEST" => "1"),
                            ports=Dict(9955 => hp), wait_strategy=c -> true)
@@ -228,7 +229,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
             idx = findfirst(c -> c.id == cont.id, listed)
             @test idx !== nothing
             observed = listed[idx]
-            @test observed.options.name == "harbor-ps-safety-test"
+            @test observed.options.name == PS_SAFETY_NAME
             @test observed.image.name == "alpine"
             @test observed.status == :running
             @test observed.created_at isa DateTime
@@ -319,14 +320,18 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test err isa Harbor.WaitTimeoutError
     end
 
-    @testset "foreground non-zero exit returns the handle, no leak" begin
+    @testset "foreground non-zero exit returns the handle, including 125" begin
         before = length(Harbor.docker_ps(all=true, label=Harbor.HARBOR_LABEL * "=true"))
-        cont = Harbor.run!(ALPINE; command=["sh", "-c", "echo failing-output; exit 7"], detach=false)
-        @test cont.status == :exited
-        @test occursin("failing-output", Harbor.logs(cont))
-        info = Harbor.inspect(cont)
-        @test get(get(info, "State", Dict{String, Any}()), "ExitCode", -1) == 7
-        Harbor.remove!(cont; force=true)
+        for exit_code in (7, 125)
+            cont = Harbor.run!(ALPINE;
+                command=["sh", "-c", "echo failing-output-$exit_code; exit $exit_code"],
+                detach=false)
+            @test cont.status == :exited
+            @test occursin("failing-output-$exit_code", Harbor.logs(cont))
+            info = Harbor.inspect(cont)
+            @test get(get(info, "State", Dict{String, Any}()), "ExitCode", -1) == exit_code
+            Harbor.remove!(cont; force=true)
+        end
         # foreground + ports: the auto port-wait must not fire for exited runs
         cont2 = Harbor.run!(ALPINE; command=["true"], detach=false, ports=Dict(8080 => 0))
         @test cont2.status == :exited
@@ -352,7 +357,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
     @testset "wait timeout removes the container and reports logs" begin
         img = ALPINE
         err = try
-            Harbor.run!(img; name="harbor-wait-timeout-test",
+            Harbor.run!(img; name=WAIT_TIMEOUT_NAME,
                         command=["sh", "-c", "echo some-log-line; sleep 60"],
                         wait_strategy=(pattern="never-going-to-appear",),
                         wait_timeout=3.0, wait_interval=0.5)
@@ -365,7 +370,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test occursin("never-going-to-appear", msg)
         @test occursin("some-log-line", msg)  # container logs included
         # the container was synchronously removed; its name is free again
-        @test isempty(chomp(read(`docker ps -aq --filter name=harbor-wait-timeout-test`, String)))
+        @test isempty(chomp(read(`docker ps -aq --filter name=$WAIT_TIMEOUT_NAME`, String)))
     end
 
     @testset "with_container cleans up synchronously" begin
@@ -382,7 +387,7 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
 
         # a fixed name is immediately reusable
         for _ in 1:2
-            Harbor.with_container(img; name="harbor-name-reuse-test", command=["sleep", "60"]) do cont
+            Harbor.with_container(img; name=NAME_REUSE_NAME, command=["sleep", "60"]) do cont
                 @test Harbor.is_running(cont)
             end
         end
@@ -433,6 +438,33 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
         @test !occursin("unique-secret-value", str)
         # unmanaged handles have no finalizer side effects
         finalize(cont)
+    end
+
+    @testset "inspect errors preserve daemon failures" begin
+        missing = Harbor.DockerError(`docker inspect missing`, 1,
+                                     "Error: No such object: missing")
+        daemon = Harbor.DockerError(`docker inspect missing`, 1,
+                                    "Cannot connect to the Docker daemon")
+        @test Harbor._is_missing_container_error(missing)
+        @test !Harbor._is_missing_container_error(daemon)
+        fake = Harbor.Container("missing", Harbor.Image("alpine"), :removed,
+                                now(), Harbor.RunOptions())
+        @test !Harbor.is_running(fake)
+        Harbor.cleanup!(fake)
+        @test fake.cleaned_up
+        @test fake.status == :removed
+        failed_cleanup = Harbor.Container("missing", Harbor.Image("alpine"),
+                                          :running, now(), Harbor.RunOptions())
+        missing_socket = "unix://" * joinpath(tempdir(),
+                                               "harbor-missing-$TEST_RUN_SUFFIX.sock")
+        withenv("DOCKER_HOST" => missing_socket) do
+            @test_throws Harbor.DockerError Harbor.is_running(failed_cleanup)
+            @test Harbor.cleanup!(failed_cleanup) === nothing
+            @test !failed_cleanup.cleaned_up
+            @test failed_cleanup.status == :running
+            @test_throws Harbor.DockerError Harbor.cleanup!(failed_cleanup;
+                                                             throw_errors=true)
+        end
     end
 
     if !IS_CI

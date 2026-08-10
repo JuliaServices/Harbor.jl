@@ -17,6 +17,11 @@ function Base.showerror(io::IO, e::DockerError)
     end
 end
 
+function _is_missing_container_error(e::DockerError)::Bool
+    message = lowercase(e.stderr)
+    return occursin("no such object", message) || occursin("no such container", message)
+end
+
 # Pass container environment values through a private temporary file. Passing
 # `-e KEY=VALUE` exposes values in the host process list, while passing `-e KEY`
 # and adding the values to the docker CLI process environment lets names such
@@ -133,6 +138,21 @@ function docker_rm_image(image::Image; force::Bool=false)::Bool
     return true
 end
 
+# A foreground `docker run` normally returns the container process's exit code.
+# Exit code 125 is ambiguous because the docker CLI also reserves it for its own
+# failures. A completed container with the same recorded exit code proves that
+# the container process ran and the caller should receive its handle.
+function _container_exited_with_code(container_id::String, exitcode::Int)::Bool
+    info = try
+        docker_inspect_container(container_id)
+    catch e
+        e isa DockerError || rethrow()
+        return false
+    end
+    state = get(info, "State", Dict{String, Any}())
+    return get(state, "Status", "") == "exited" && get(state, "ExitCode", nothing) == exitcode
+end
+
 """
     docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                volumes=Dict{String,String}(), environment=Dict{String,String}(),
@@ -188,10 +208,10 @@ function docker_run(image::Image; name=nothing, ports=Dict{Int,Int}(),
                 if e isa DockerError
                     cid = isfile(cidfile) ? String(chomp(read(cidfile, String))) : ""
                     if !isempty(cid)
-                        if !detach && e.exitcode != 125
+                        if !detach && (e.exitcode != 125 || _container_exited_with_code(cid, e.exitcode))
                             # A foreground run's CLI exit status is the
-                            # container's exit status. Docker reserves 125 for
-                            # its own failures.
+                            # container's exit status. Inspect disambiguates a
+                            # real container exit 125 from a docker CLI failure.
                             return cid
                         end
                         # The container was created but docker still failed

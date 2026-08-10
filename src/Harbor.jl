@@ -90,6 +90,10 @@ images()::Vector{Image} = docker_images()
 remove(image::Image; force::Bool=false) -> Bool
 
 Removes the specified image.
+
+For a digest-pinned `Image` with no tag, Docker removes the underlying image
+and every local tag that points to it. This is Docker's `rmi name@digest`
+behavior; use digest removal only when deleting all such tags is intended.
 """
 function remove(image::Image; force::Bool=false)::Bool
     @debug "Removing image" image force
@@ -673,7 +677,7 @@ function is_running(container::Container)::Bool
     info = try
         docker_inspect_container(container.id)
     catch e
-        e isa DockerError && return false
+        e isa DockerError && _is_missing_container_error(e) && return false
         rethrow()
     end
     return get(get(info, "State", Dict{String, Any}()), "Running", false) === true
@@ -694,21 +698,29 @@ function remove!(container::Container; force::Bool=false)::Bool
 end
 
 """
-    cleanup!(container::Container)
+    cleanup!(container::Container; throw_errors::Bool=false)
 
 Synchronously force-remove the container (stopping it if necessary). Safe to
 call multiple times; does nothing if the container was already removed via
-`remove!` or a previous `cleanup!`. Errors during removal are logged at debug
-level and otherwise ignored.
+`remove!` or a previous `cleanup!`. A failed removal leaves the handle eligible
+for another cleanup attempt. Errors are logged at debug level by default; set
+`throw_errors=true` to propagate them.
 """
-function cleanup!(container::Container)
+function cleanup!(container::Container; throw_errors::Bool=false)
     container.cleaned_up && return nothing
-    container.cleaned_up = true
     try
         docker_rm(container.id; force=true)
     catch e
+        if e isa DockerError && _is_missing_container_error(e)
+            container.cleaned_up = true
+            container.status = :removed
+            return nothing
+        end
+        throw_errors && rethrow()
         @debug "Container cleanup failed" container_id=container.id exception=(e, catch_backtrace())
+        return nothing
     end
+    container.cleaned_up = true
     container.status = :removed
     return nothing
 end
@@ -738,7 +750,7 @@ function ps(; all::Bool=true)::Vector{Container}
         info = try
             docker_inspect_container(id)
         catch e
-            e isa DockerError && continue
+            e isa DockerError && _is_missing_container_error(e) && continue
             rethrow()
         end
         config = get(info, "Config", Dict{String, Any}())
@@ -825,8 +837,11 @@ before the block's exception is rethrown.
 """
 function with_container(f::Function, image::Image; container_logs_on_error::Bool=false, kw...)
     container = run!(image; kw...)
+    block_succeeded = false
     try
-        return f(container)
+        result = f(container)
+        block_succeeded = true
+        return result
     catch
         if container_logs_on_error
             logs_output = try
@@ -838,7 +853,9 @@ function with_container(f::Function, image::Image; container_logs_on_error::Bool
         end
         rethrow()
     finally
-        cleanup!(container)
+        # A cleanup failure after a successful block must be visible to the
+        # caller. On the error path, preserve the block's original exception.
+        cleanup!(container; throw_errors=block_succeeded)
     end
 end
 
