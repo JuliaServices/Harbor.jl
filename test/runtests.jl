@@ -284,6 +284,18 @@ const BUSYBOX = Harbor.pull("busybox"; tag="latest")
             response = read(sock, String)
             close(sock)
             @test occursin("404", first(split(response, "\r\n")))
+
+            # Observed handles must retain the request as well as the current mapping.
+            observed = only(filter(c -> c.id == cont.id, Harbor.ps()))
+            @test observed.options.ports == Dict(8080 => 0)
+            @test Harbor.host_port(observed, 8080) == hp
+            Harbor.stop!(observed; timeout=1)
+            observed = only(filter(c -> c.id == cont.id, Harbor.ps()))
+            @test observed.options.ports == Dict(8080 => 0)
+            Harbor.start!(observed)
+            @test Harbor.host_port(observed, 8080) == Harbor.docker_resolved_ports(cont.id)[8080]
+            Harbor.restart!(observed; timeout=1)
+            @test Harbor.host_port(observed, 8080) == Harbor.docker_resolved_ports(cont.id)[8080]
         end
     end
 

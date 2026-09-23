@@ -794,7 +794,9 @@ function ps(; all::Bool=true)::Vector{Container}
             # key is like: "80/tcp"; value is null for unbound exposed ports
             (v === nothing || isempty(v)) && continue
             container_port = tryparse(Int, first(split(k, "/")))
-            host_port = tryparse(Int, string(get(v[1], "HostPort", "")))
+            # Docker records an ephemeral port request as an empty HostPort.
+            requested_port = string(get(v[1], "HostPort", ""))
+            host_port = isempty(requested_port) ? 0 : tryparse(Int, requested_port)
             (container_port === nothing || host_port === nothing) && continue
             ports[container_port] = host_port
         end
